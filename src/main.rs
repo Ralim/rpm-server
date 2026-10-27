@@ -1,3 +1,13 @@
-fn main() {
-    println!("Hello, world!");
+use clap::Parser;
+use rpm_server::config::Config;
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    rpm_server::run(Config::parse()).await
 }
