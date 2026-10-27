@@ -26,4 +26,8 @@ ENV RPM_SERVER_DIR=/srv/rpms \
   RPM_SERVER_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 USER 65532:65532
+# Kept only in docker-format images: build with `podman build --format docker`.
+# Healthchecks during the start period (initial scan of the folder) don't count.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
+  CMD ["/rpm-server", "--healthcheck"]
 ENTRYPOINT ["/rpm-server"]

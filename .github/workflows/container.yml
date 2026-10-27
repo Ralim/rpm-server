@@ -90,7 +90,9 @@ jobs:
           for tag in $TAGS; do
             tag_args+=(--tag "$IMAGE:$tag")
           done
+          # docker format: the OCI image format has no HEALTHCHECK.
           podman build \
+            --format docker \
             --file Containerfile \
             --label "org.opencontainers.image.source=$SOURCE" \
             --label "org.opencontainers.image.version=$VERSION" \
@@ -103,7 +105,21 @@ jobs:
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           VERSION: ${{ steps.meta.outputs.version }}
-        run: podman run --rm "$IMAGE:$VERSION" --version | grep -F "$VERSION"
+        run: |
+          podman run --rm "$IMAGE:$VERSION" --version | grep -F "$VERSION"
+
+          rpms="$(mktemp -d)"
+          chmod 755 "$rpms"
+          podman run -d --name smoke -v "$rpms:/srv/rpms:ro,Z" "$IMAGE:$VERSION"
+          trap 'podman logs smoke; podman rm -f smoke' EXIT
+          for _ in $(seq 1 20); do
+            if podman healthcheck run smoke; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Container never became healthy"
+          exit 1
 
       - name: Push image
         if: github.event_name != 'pull_request'
@@ -116,5 +132,5 @@ jobs:
           printf '%s' "$REGISTRY_PASSWORD" \
             | podman login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
           for tag in $TAGS; do
-            podman push "$IMAGE:$tag"
+            podman push --format v2s2 "$IMAGE:$tag"
           done

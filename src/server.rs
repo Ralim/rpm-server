@@ -36,6 +36,8 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
 #[derive(Debug)]
 pub struct AppState {
     repo: RwLock<Arc<Repo>>,
+    /// Error from the most recent rescan, if it failed.
+    scan_error: RwLock<Option<String>>,
     repo_id: String,
     base_url: Option<String>,
 }
@@ -46,6 +48,7 @@ impl AppState {
     pub fn new(repo: Repo, repo_id: String, base_url: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             repo: RwLock::new(Arc::new(repo)),
+            scan_error: RwLock::new(None),
             repo_id,
             base_url: base_url.map(|u| u.trim_end_matches('/').to_owned()),
         })
@@ -59,17 +62,56 @@ impl AppState {
         *self.repo.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(repo);
     }
 
+    /// Records the outcome of a rescan; a failure makes `/healthz` report unhealthy.
+    pub fn set_scan_error(&self, error: Option<String>) {
+        *self.scan_error.write().unwrap_or_else(|e| e.into_inner()) = error;
+    }
+
+    fn scan_error(&self) -> Option<String> {
+        self.scan_error
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn repo_file_name(&self) -> String {
         format!("{}.repo", self.repo_id)
     }
 }
 
+/// Path of the health endpoint.
+pub const HEALTH_PATH: &str = "/healthz";
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route(HEALTH_PATH, get(health))
         .route("/", get(handle))
         .route("/{*path}", get(handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// 200 while the last rescan succeeded, 503 if it failed (e.g. the package
+/// folder became unreadable).
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let headers = [
+        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        (header::CACHE_CONTROL, "no-store"),
+    ];
+    match state.scan_error() {
+        None => {
+            let repo = state.repo();
+            let body = format!(
+                "ok packages={} revision={}\n",
+                repo.package_count, repo.revision
+            );
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Some(err) => {
+            let body = format!("unhealthy: last rescan failed: {err}\n");
+            (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
+        }
+    }
 }
 
 async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
@@ -641,6 +683,27 @@ mod tests {
         assert!(text.contains("baseurl=https://repo.example/\n"));
         assert!(text.contains("gpgcheck=1\n") && text.contains("repo_gpgcheck=1\n"));
         assert!(text.contains("gpgkey=https://repo.example/RPM-GPG-KEY\n"));
+    }
+
+    #[tokio::test]
+    async fn health_endpoint() {
+        let f = fixture(false);
+        let (status, headers, body) = get(&f.state, "/healthz", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .starts_with("ok packages=1 revision=")
+        );
+
+        f.state.set_scan_error(Some("disk on fire".into()));
+        let (status, _, body) = get(&f.state, "/healthz", &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(std::str::from_utf8(&body).unwrap().contains("disk on fire"));
+
+        f.state.set_scan_error(None);
+        assert_eq!(get(&f.state, "/healthz", &[]).await.0, StatusCode::OK);
     }
 
     #[tokio::test]

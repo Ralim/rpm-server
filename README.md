@@ -16,7 +16,7 @@ CI (`.github/workflows/container.yml`) publishes images to `ghcr.io/<owner>/rpm-
 To build the image locally:
 
 ```sh
-podman build -t rpm-server -f Containerfile .
+podman build --format docker -t rpm-server -f Containerfile .
 
 # Unsigned: packages are served exactly as they are on disk.
 podman run -d -p 8080:8080 -v ./rpms:/srv/rpms:ro,Z rpm-server
@@ -33,6 +33,8 @@ podman run -d -p 8080:8080 -v ./rpms:/srv/rpms:ro,Z \
 ```
 
 The container runs as uid 65532, so the mounted RPMs must be world-readable.
+
+`GET /healthz` returns `200 ok packages=N revision=R`, or `503` with the error if the last rescan failed (for example, the package folder became unreadable). The image runs `rpm-server --healthcheck` against it every 30 seconds, with a 5-minute start period so a long initial scan doesn't count as a failure. Check the status with `podman healthcheck run <container>` or `podman ps`. `--format docker` is needed because OCI-format images have no `HEALTHCHECK`.
 
 New, changed or removed RPMs are noticed via inotify and served about 2 seconds after writes stop. inotify doesn't see changes made by other hosts on NFS/SMB mounts; those are picked up by the hourly full rescan (`RPM_SERVER_RESCAN_INTERVAL`).
 

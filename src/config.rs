@@ -71,6 +71,11 @@ pub struct Config {
     /// Seconds between source downloads (they also run at startup).
     #[arg(long, env = "RPM_SERVER_UPDATE_INTERVAL", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(1..))]
     pub update_interval: u64,
+
+    /// Query the health endpoint of the server on --listen and exit
+    /// (0 healthy, 1 unhealthy) instead of starting a server.
+    #[arg(long)]
+    pub healthcheck: bool,
 }
 
 fn parse_repo_id(s: &str) -> Result<String, String> {

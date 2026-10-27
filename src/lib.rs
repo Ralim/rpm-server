@@ -2,6 +2,7 @@
 //! `repodata/` in memory and optionally re-signing packages on the fly.
 
 pub mod config;
+pub mod health;
 pub mod package;
 pub mod repo;
 pub mod repodata;
@@ -65,13 +66,21 @@ pub fn spawn_rescan(
                 Ok((s, result)) => {
                     scanner = Some(s);
                     match result {
-                        Ok(Some(repo)) => state.set_repo(repo),
-                        Ok(None) => {}
-                        Err(err) => error!("rescan failed, keeping previous metadata: {err:#}"),
+                        Ok(repo) => {
+                            state.set_scan_error(None);
+                            if let Some(repo) = repo {
+                                state.set_repo(repo);
+                            }
+                        }
+                        Err(err) => {
+                            error!("rescan failed, keeping previous metadata: {err:#}");
+                            state.set_scan_error(Some(format!("{err:#}")));
+                        }
                     }
                 }
                 Err(err) => {
                     error!("rescan task panicked, rescanning disabled: {err}");
+                    state.set_scan_error(Some("rescan task panicked".into()));
                     return;
                 }
             }
@@ -219,5 +228,40 @@ mod tests {
 
         std::fs::remove_file(root.join("new/a.rpm")).unwrap();
         wait_for(&state, "new/a.rpm", false).await;
+    }
+
+    async fn wait_for_health(state: &Arc<AppState>, status: u16) {
+        use tower::ServiceExt;
+        for _ in 0..100 {
+            let req = axum::http::Request::get("/healthz")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = server::router(state.clone()).oneshot(req).await.unwrap();
+            if resp.status().as_u16() == status {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("health never reached {status}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_rescan_marks_unhealthy_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rpms");
+        std::fs::create_dir(&root).unwrap();
+        let mut scanner = Scanner::new(root.clone(), None);
+        let state = AppState::new(scanner.scan().unwrap().unwrap(), "test".into(), None);
+        let trigger = Arc::new(Notify::new());
+        spawn_rescan(scanner, state.clone(), None, trigger.clone());
+        wait_for_health(&state, 200).await;
+
+        std::fs::remove_dir(&root).unwrap();
+        trigger.notify_one();
+        wait_for_health(&state, 503).await;
+
+        std::fs::create_dir(&root).unwrap();
+        trigger.notify_one();
+        wait_for_health(&state, 200).await;
     }
 }
