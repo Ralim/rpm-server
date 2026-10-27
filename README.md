@@ -34,6 +34,13 @@ podman run -d -p 8080:8080 -v ./rpms:/srv/rpms:ro,Z \
 
 The container runs as uid 65532, so the mounted RPMs must be world-readable.
 
+The repository root contains:
+
+- `static/`: the RPMs from the mounted folder, keeping its subfolder layout
+- `downloaded/`: RPMs fetched from online sources (see below)
+- `repodata/`: the generated metadata
+- `RPM-GPG-KEY` and `<repo-id>.repo`
+
 `GET /healthz` returns `200 ok packages=N revision=R`, or `503` with the error if the last rescan failed (for example, the package folder became unreadable). The image runs `rpm-server --healthcheck` against it every 30 seconds, with a 5-minute start period so a long initial scan doesn't count as a failure. Check the status with `podman healthcheck run <container>` or `podman ps`. `--format docker` is needed because OCI-format images have no `HEALTHCHECK`.
 
 New, changed or removed RPMs are noticed via inotify and served about 2 seconds after writes stop. inotify doesn't see changes made by other hosts on NFS/SMB mounts; those are picked up by the hourly full rescan (`RPM_SERVER_RESCAN_INTERVAL`).
@@ -113,7 +120,7 @@ Every flag (see `rpm-server --help`) has an environment variable:
 
 | Variable                                                       | Default        | Meaning                                                                                       |
 | -------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------- |
-| `RPM_SERVER_DIR`                                               | `/srv/rpms`    | Folder of `.rpm` files, searched recursively                                                  |
+| `RPM_SERVER_DIR`                                               | `/srv/rpms`    | Folder of `.rpm` files, searched recursively and served under `/static/`                      |
 | `RPM_SERVER_LISTEN`                                            | `0.0.0.0:8080` | Listen address                                                                                |
 | `RPM_SERVER_GPG_KEY`                                           |                | ASCII-armored secret key; enables signing                                                     |
 | `RPM_SERVER_GPG_PASSPHRASE` / `RPM_SERVER_GPG_PASSPHRASE_FILE` |                | Key passphrase                                                                                |

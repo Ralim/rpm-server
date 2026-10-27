@@ -154,7 +154,7 @@ cat /etc/yum.repos.d/{REPO_ID}.repo
 grep -q '^gpgcheck=1$' /etc/yum.repos.d/{REPO_ID}.repo
 grep -q '^repo_gpgcheck=1$' /etc/yum.repos.d/{REPO_ID}.repo
 dnf -y --disablerepo='*' --enablerepo={REPO_ID} install hello-rpmserve
-curl -fsS -o /tmp/data.rpm '{base_url}/nested/dir/hello-rpmserve-data++-1.0-1.noarch.rpm'
+curl -fsS -o /tmp/data.rpm '{base_url}/static/nested/dir/hello-rpmserve-data++-1.0-1.noarch.rpm'
 rpm -K /tmp/data.rpm | grep 'signatures OK'
 echo "GREETING: $(hello-rpmserve)"
 "#

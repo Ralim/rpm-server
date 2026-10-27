@@ -224,10 +224,10 @@ mod tests {
 
         std::fs::create_dir(root.join("new")).unwrap();
         std::fs::write(root.join("new/a.rpm"), testutil::build_rpm("a", "1.0", &[])).unwrap();
-        wait_for(&state, "new/a.rpm", true).await;
+        wait_for(&state, "static/new/a.rpm", true).await;
 
         std::fs::remove_file(root.join("new/a.rpm")).unwrap();
-        wait_for(&state, "new/a.rpm", false).await;
+        wait_for(&state, "static/new/a.rpm", false).await;
     }
 
     async fn wait_for_health(state: &Arc<AppState>, status: u16) {

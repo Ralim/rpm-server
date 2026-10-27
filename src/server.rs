@@ -462,7 +462,7 @@ mod tests {
         (status, headers, body)
     }
 
-    const RPM_URI: &str = "/sub%20dir/demo%2B%2B.rpm";
+    const RPM_URI: &str = "/static/sub%20dir/demo%2B%2B.rpm";
 
     #[test]
     fn range_parsing() {
@@ -548,7 +548,7 @@ mod tests {
     async fn serves_signed_package_matching_metadata() {
         let f = fixture(true);
         let repo = f.state.repo();
-        let Some(Entry::Rpm(entry)) = repo.get("sub dir/demo++.rpm") else {
+        let Some(Entry::Rpm(entry)) = repo.get("static/sub dir/demo++.rpm") else {
             panic!("package missing");
         };
         let (status, _, body) = get(&f.state, RPM_URI, &[]).await;
@@ -578,7 +578,7 @@ mod tests {
     async fn range_requests_span_prefix_and_payload() {
         let f = fixture(true);
         let (_, _, full) = get(&f.state, RPM_URI, &[]).await;
-        let prefix_len = match f.state.repo().get("sub dir/demo++.rpm") {
+        let prefix_len = match f.state.repo().get("static/sub dir/demo++.rpm") {
             Some(Entry::Rpm(e)) => e.prefix.len(),
             _ => unreachable!(),
         };
@@ -626,21 +626,31 @@ mod tests {
                 .starts_with("text/html")
         );
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains(r#"<a href="sub%20dir/">sub dir/</a>"#));
+        assert!(html.contains(r#"<a href="static/">static/</a>"#));
         assert!(html.contains(r#"<a href="repodata/">repodata/</a>"#));
         assert!(html.contains(r#"<a href="local.repo">local.repo</a>"#));
+        assert!(!html.contains("sub dir"));
         assert!(!html.contains(r#"href="../""#));
 
-        let (status, _, body) = get(&f.state, "/sub%20dir/", &[]).await;
+        let (status, _, body) = get(&f.state, "/static/", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(r#"<a href="sub%20dir/">sub dir/</a>"#));
+
+        let (status, _, body) = get(&f.state, "/static/sub%20dir/", &[]).await;
         assert_eq!(status, StatusCode::OK);
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains(r#"<a href="demo++.rpm">demo++.rpm</a>"#));
         assert!(html.contains("demo-1.0-1.noarch \u{2014} A test package"));
         assert!(html.contains(r#"href="../""#));
 
-        let (status, headers, _) = get(&f.state, "/sub%20dir", &[]).await;
+        let (status, headers, _) = get(&f.state, "/static/sub%20dir", &[]).await;
         assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(headers[header::LOCATION], "/sub%20dir/");
+        assert_eq!(headers[header::LOCATION], "/static/sub%20dir/");
+        assert_eq!(
+            get(&f.state, "/sub%20dir/demo%2B%2B.rpm", &[]).await.0,
+            StatusCode::NOT_FOUND
+        );
 
         assert_eq!(
             get(&f.state, "/missing/", &[]).await.0,
@@ -709,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn stale_package_is_not_served() {
         let f = fixture(false);
-        let path = match f.state.repo().get("sub dir/demo++.rpm") {
+        let path = match f.state.repo().get("static/sub dir/demo++.rpm") {
             Some(Entry::Rpm(e)) => e.abs_path.clone(),
             _ => unreachable!(),
         };

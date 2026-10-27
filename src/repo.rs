@@ -18,8 +18,8 @@ use crate::signing::RepoSigner;
 
 /// Path of the armored public key, relative to the repository root.
 pub const KEY_PATH: &str = "RPM-GPG-KEY";
-/// Top-level directory holding generated metadata; skipped when scanning.
-const REPODATA_DIR: &str = "repodata";
+/// Path under which the mounted package folder appears in the repository.
+pub const STATIC_PREFIX: &str = "static";
 const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -142,15 +142,8 @@ struct FileStamp {
 }
 
 /// Recursively collects `.rpm` files under `dir`, whose repository path is
-/// `rel`. Hidden entries and, at the repository root, `reserved` names are
-/// skipped.
-fn walk(
-    dir: &Path,
-    rel: &str,
-    depth: usize,
-    reserved: &[&str],
-    out: &mut Vec<FileStamp>,
-) -> Result<()> {
+/// `rel`. Hidden entries are skipped.
+fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<FileStamp>) -> Result<()> {
     let read = fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
     for item in read {
         let item = item?;
@@ -161,15 +154,7 @@ fn walk(
         if name.starts_with('.') {
             continue;
         }
-        if rel.is_empty() && reserved.contains(&name.as_str()) {
-            warn!(path = %item.path().display(), "skipping entry with a reserved name");
-            continue;
-        }
-        let child_rel = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
+        let child_rel = format!("{rel}/{name}");
         // Follows symlinks, so linked files and directories are included.
         let meta = match fs::metadata(item.path()) {
             Ok(m) => m,
@@ -183,7 +168,7 @@ fn walk(
                 warn!(path = %item.path().display(), "maximum directory depth reached");
                 continue;
             }
-            if let Err(err) = walk(&item.path(), &child_rel, depth + 1, &[], out) {
+            if let Err(err) = walk(&item.path(), &child_rel, depth + 1, out) {
                 warn!(path = %item.path().display(), %err, "skipping directory");
             }
         } else if meta.is_file() && name.ends_with(".rpm") {
@@ -245,8 +230,7 @@ impl Scanner {
         }
     }
 
-    /// Serves the packages in `dir` under `/<name>/`. A same-named entry at
-    /// the top of the main folder is then ignored.
+    /// Also serves the packages in `dir` under `/<name>/`.
     pub fn with_extra_root(mut self, name: &str, dir: PathBuf) -> Self {
         self.extra_roots.push((name.to_owned(), dir));
         self
@@ -254,12 +238,10 @@ impl Scanner {
 
     /// Returns a new snapshot, or `None` if nothing changed since the last scan.
     pub fn scan(&mut self) -> Result<Option<Repo>> {
-        let mut reserved = vec![REPODATA_DIR];
-        reserved.extend(self.extra_roots.iter().map(|(name, _)| name.as_str()));
         let mut stamps = Vec::new();
-        walk(&self.root, "", 0, &reserved, &mut stamps)?;
+        walk(&self.root, STATIC_PREFIX, 1, &mut stamps)?;
         for (name, dir) in &self.extra_roots {
-            if let Err(err) = walk(dir, name, 1, &[], &mut stamps) {
+            if let Err(err) = walk(dir, name, 1, &mut stamps) {
                 warn!(dir = %dir.display(), "skipping folder: {err:#}");
             }
         }
@@ -330,7 +312,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            root.join("repodata/ignored.rpm"),
+            root.join("repodata/inside-mount.rpm"),
             testutil::build_rpm("c", "1", &[]),
         )
         .unwrap();
@@ -344,36 +326,42 @@ mod tests {
 
         let mut scanner = Scanner::new(root.to_owned(), None);
         let repo = scanner.scan().unwrap().expect("first scan yields a repo");
-        assert_eq!(repo.package_count, 2);
+        assert_eq!(repo.package_count, 3);
         assert!(!repo.signs_repo);
         assert!(repo.get(KEY_PATH).is_none());
-        assert!(matches!(repo.get("a.rpm"), Some(Entry::Rpm(_))));
+        assert!(matches!(repo.get("static/a.rpm"), Some(Entry::Rpm(_))));
         assert!(matches!(
-            repo.get("nested/deeper/b.rpm"),
+            repo.get("static/nested/deeper/b.rpm"),
             Some(Entry::Rpm(_))
         ));
-        assert!(repo.get("repodata/ignored.rpm").is_none());
+        // A repodata/ folder in the mount does not clash with generated metadata.
+        assert!(repo.get("static/repodata/inside-mount.rpm").is_some());
         assert!(repo.get("repodata/repomd.xml").is_some());
+        assert!(repo.get("a.rpm").is_none());
 
+        assert_eq!(names(&repo.list_dir("").unwrap()), ["repodata/", "static/"]);
         assert_eq!(
-            names(&repo.list_dir("").unwrap()),
+            names(&repo.list_dir("static/").unwrap()),
             ["nested/", "repodata/", "a.rpm"]
         );
-        assert_eq!(names(&repo.list_dir("nested/").unwrap()), ["deeper/"]);
+        assert_eq!(
+            names(&repo.list_dir("static/nested/").unwrap()),
+            ["deeper/"]
+        );
         assert!(repo.list_dir("missing/").is_none());
-        assert!(repo.is_dir("nested"));
-        assert!(repo.is_dir("nested/deeper"));
-        assert!(!repo.is_dir("nest"));
-        assert!(!repo.is_dir("a.rpm"));
+        assert!(repo.is_dir("static"));
+        assert!(repo.is_dir("static/nested/deeper"));
+        assert!(!repo.is_dir("static/nest"));
+        assert!(!repo.is_dir("static/a.rpm"));
 
         assert!(scanner.scan().unwrap().is_none(), "unchanged directory");
 
         fs::remove_file(root.join("a.rpm")).unwrap();
         fs::write(root.join("c.rpm"), testutil::build_rpm("c", "2", &[])).unwrap();
         let repo = scanner.scan().unwrap().expect("changed directory");
-        assert_eq!(repo.package_count, 2);
-        assert!(repo.get("a.rpm").is_none());
-        assert!(repo.get("c.rpm").is_some());
+        assert_eq!(repo.package_count, 3);
+        assert!(repo.get("static/a.rpm").is_none());
+        assert!(repo.get("static/c.rpm").is_some());
     }
 
     #[test]
@@ -391,7 +379,7 @@ mod tests {
             other => panic!("unexpected key entry: {other:?}"),
         }
         assert!(repo.get("repodata/repomd.xml.asc").is_some());
-        match repo.get("a.rpm") {
+        match repo.get("static/a.rpm") {
             Some(Entry::Rpm(e)) => assert!(!e.prefix.is_empty()),
             other => panic!("unexpected package entry: {other:?}"),
         }
@@ -401,6 +389,7 @@ mod tests {
     fn extra_root_is_served_under_its_name() {
         let main = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
+        // Same name as the extra root: still served, under static/.
         fs::create_dir_all(main.path().join("downloaded")).unwrap();
         fs::write(
             main.path().join("a.rpm"),
@@ -408,7 +397,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            main.path().join("downloaded/shadowed.rpm"),
+            main.path().join("downloaded/local.rpm"),
             testutil::build_rpm("s", "1", &[]),
         )
         .unwrap();
@@ -422,10 +411,14 @@ mod tests {
         let mut scanner = Scanner::new(main.path().to_owned(), None)
             .with_extra_root("downloaded", extra.path().to_owned());
         let repo = scanner.scan().unwrap().unwrap();
-        assert_eq!(repo.package_count, 2);
-        assert!(repo.get("a.rpm").is_some());
+        assert_eq!(repo.package_count, 3);
+        assert!(repo.get("static/a.rpm").is_some());
+        assert!(repo.get("static/downloaded/local.rpm").is_some());
         assert!(repo.get("downloaded/b.rpm").is_some());
-        assert!(repo.get("downloaded/shadowed.rpm").is_none());
+        assert_eq!(
+            names(&repo.list_dir("").unwrap()),
+            ["downloaded/", "repodata/", "static/"]
+        );
         assert_eq!(names(&repo.list_dir("downloaded/").unwrap()), ["b.rpm"]);
 
         fs::write(
@@ -439,7 +432,7 @@ mod tests {
         // A missing extra folder is skipped rather than failing the scan.
         let mut scanner = Scanner::new(main.path().to_owned(), None)
             .with_extra_root("downloaded", PathBuf::from("/nonexistent/rpm-server-test"));
-        assert_eq!(scanner.scan().unwrap().unwrap().package_count, 1);
+        assert_eq!(scanner.scan().unwrap().unwrap().package_count, 2);
     }
 
     #[test]
