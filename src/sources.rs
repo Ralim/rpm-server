@@ -25,11 +25,25 @@ const STATE_DIR: &str = ".sources";
 const MAX_DOWNLOAD_BYTES: u64 = 4 << 30;
 const GITHUB_API: &str = "https://api.github.com/";
 
+/// A download: a GET, or a POST of a form (e.g. a license acceptance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub url: Url,
+    /// URL-encoded form body; when set the request is a POST.
+    pub form: Option<String>,
+}
+
+impl From<Url> for Request {
+    fn from(url: Url) -> Self {
+        Self { url, form: None }
+    }
+}
+
 /// One line of the sources file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// A URL serving a single RPM.
-    Url(Url),
+    Url(Request),
     /// Every `.rpm` asset of a GitHub project's latest release.
     GitHubLatest { owner: String, repo: String },
 }
@@ -37,7 +51,8 @@ pub enum Source {
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Source::Url(url) => write!(f, "{url}"),
+            Source::Url(Request { url, form: None }) => write!(f, "{url}"),
+            Source::Url(Request { url, form: Some(_) }) => write!(f, "{url} (POST)"),
             Source::GitHubLatest { owner, repo } => write!(f, "github:{owner}/{repo}"),
         }
     }
@@ -74,24 +89,49 @@ impl Source {
                 };
             }
         }
-        Source::Url(url)
+        Source::Url(url.into())
     }
 }
 
-/// Parses a sources file: one http(s) URL per line, `#` comments and blank
-/// lines ignored. Invalid lines are logged and skipped.
+/// Parses one sources line: a URL followed by optional `key=value` options.
+/// The only option is `post=<url-encoded form>`, which downloads by
+/// submitting that form (e.g. a vendor's license acceptance).
+fn parse_line(line: &str) -> Result<Source> {
+    let mut parts = line.split_whitespace();
+    let raw_url = parts.next().unwrap_or_default();
+    let url = Url::parse(raw_url).context("invalid URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("unsupported URL scheme {:?}", url.scheme());
+    }
+    let mut form = None;
+    for option in parts {
+        match option.split_once('=') {
+            Some(("post", value)) if !value.is_empty() => form = Some(value.to_owned()),
+            _ => bail!("unknown option {option:?} (expected post=<form data>)"),
+        }
+    }
+    match (Source::from_url(url), form) {
+        (source, None) => Ok(source),
+        (Source::Url(req), Some(form)) => Ok(Source::Url(Request {
+            form: Some(form),
+            ..req
+        })),
+        (Source::GitHubLatest { .. }, Some(_)) => {
+            bail!("post= is not supported for GitHub project URLs")
+        }
+    }
+}
+
+/// Parses a sources file: one source per line, `#` comments and blank lines
+/// ignored. Invalid lines are logged and skipped.
 pub fn parse_sources(text: &str) -> Vec<Source> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|line| match Url::parse(line) {
-            Ok(url) if matches!(url.scheme(), "http" | "https") => Some(Source::from_url(url)),
-            Ok(_) => {
-                warn!(line, "ignoring source with unsupported URL scheme");
-                None
-            }
+        .filter_map(|line| match parse_line(line) {
+            Ok(source) => Some(source),
             Err(err) => {
-                warn!(line, %err, "ignoring invalid source URL");
+                warn!(line, "ignoring source line: {err:#}");
                 None
             }
         })
@@ -274,15 +314,21 @@ impl Updater {
         Ok((release.tag_name, urls))
     }
 
-    fn state_path(&self, url: &Url) -> PathBuf {
-        let key = hex::encode(Sha256::digest(url.as_str().as_bytes()));
+    /// State is keyed by URL, plus the form for POST sources.
+    fn state_path(&self, req: &Request) -> PathBuf {
+        let mut key = req.url.as_str().to_owned();
+        if let Some(form) = &req.form {
+            key.push('\n');
+            key.push_str(form);
+        }
+        let key = hex::encode(Sha256::digest(key.as_bytes()));
         self.dir.join(STATE_DIR).join(key)
     }
 
-    async fn write_state(&self, url: &Url, state: &SourceState) -> Result<()> {
-        let path = self.state_path(url);
+    async fn write_state(&self, req: &Request, state: &SourceState) -> Result<()> {
+        let path = self.state_path(req);
         let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, state.render(url)).await?;
+        tokio::fs::write(&tmp, state.render(&req.url)).await?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok(())
     }
@@ -299,8 +345,8 @@ impl Updater {
         };
         let mut changed = false;
         for source in parse_sources(&text) {
-            let urls = match &source {
-                Source::Url(url) => vec![url.clone()],
+            let requests = match &source {
+                Source::Url(req) => vec![req.clone()],
                 Source::GitHubLatest { owner, repo } => {
                     match self.latest_release_rpms(owner, repo).await {
                         Ok((tag, urls)) => {
@@ -309,7 +355,7 @@ impl Updater {
                             } else {
                                 info!(%source, tag, assets = urls.len(), "found latest release");
                             }
-                            urls
+                            urls.into_iter().map(Request::from).collect()
                         }
                         Err(err) => {
                             warn!(%source, "source update failed: {err:#}");
@@ -318,8 +364,9 @@ impl Updater {
                     }
                 }
             };
-            for url in urls {
-                match self.update(&url).await {
+            for req in requests {
+                let url = &req.url;
+                match self.update(&req).await {
                     Ok(Outcome::Updated { file, nevra }) => {
                         info!(%source, %url, file, nevra, "stored new package from source");
                         changed = true;
@@ -334,15 +381,22 @@ impl Updater {
         changed
     }
 
-    /// Fetches one URL and stores its content if it changed.
-    pub async fn update(&self, url: &Url) -> Result<Outcome> {
-        let previous = tokio::fs::read_to_string(self.state_path(url))
+    /// Fetches one source and stores its content if it changed.
+    pub async fn update(&self, req: &Request) -> Result<Outcome> {
+        let previous = tokio::fs::read_to_string(self.state_path(req))
             .await
             .ok()
             .and_then(|t| SourceState::parse(&t))
             .filter(|s| self.dir.join(&s.file).is_file());
 
-        let mut request = self.client.get(url.clone());
+        let mut request = match &req.form {
+            Some(form) => self
+                .client
+                .post(req.url.clone())
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(form.clone()),
+            None => self.client.get(req.url.clone()),
+        };
         if let Some(etag) = previous.as_ref().and_then(|s| s.etag.as_deref()) {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
@@ -354,6 +408,17 @@ impl Updater {
             };
         }
         let mut response = response.error_for_status()?;
+        let is_html = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.trim().to_ascii_lowercase().starts_with("text/html"));
+        if is_html {
+            bail!(
+                "server returned an HTML page instead of an RPM; if it is a license \
+                 or login page, add the form it submits as a post= option"
+            );
+        }
         let etag = response
             .headers()
             .get(header::ETAG)
@@ -388,7 +453,7 @@ impl Updater {
 
         if let Some(prev) = previous.filter(|p| p.sha256 == sha256) {
             let file = prev.file.clone();
-            self.write_state(url, &SourceState { etag, ..prev }).await?;
+            self.write_state(req, &SourceState { etag, ..prev }).await?;
             return Ok(Outcome::Unchanged { file });
         }
 
@@ -416,7 +481,7 @@ impl Updater {
         let file = match &outcome {
             Outcome::Unchanged { file } | Outcome::Updated { file, .. } => file.clone(),
         };
-        self.write_state(url, &SourceState { sha256, file, etag })
+        self.write_state(req, &SourceState { sha256, file, etag })
             .await?;
         Ok(outcome)
     }
@@ -575,7 +640,7 @@ mod tests {
         let updater = Updater::new(dir.path().join("sources"), dir.path().to_owned()).unwrap();
 
         // First fetch stores the package under its NEVRA-derived name.
-        let out = updater.update(&url).await.unwrap();
+        let out = updater.update(&url.clone().into()).await.unwrap();
         assert_eq!(
             out,
             Outcome::Updated {
@@ -591,13 +656,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o644);
 
         // Same ETag: answered with 304, nothing downloaded.
-        let out = updater.update(&url).await.unwrap();
+        let out = updater.update(&url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Unchanged { .. }));
         assert_eq!(origin.lock().unwrap().conditional_hits, 1);
 
         // New ETag but identical bytes: detected by hash.
         origin.lock().unwrap().etag = Some("\"v1-again\"".into());
-        let out = updater.update(&url).await.unwrap();
+        let out = updater.update(&url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Unchanged { .. }));
 
         // New content: stored alongside the old version.
@@ -606,7 +671,7 @@ mod tests {
             o.body = v2.clone();
             o.etag = None;
         }
-        let out = updater.update(&url).await.unwrap();
+        let out = updater.update(&url.clone().into()).await.unwrap();
         assert!(
             matches!(out, Outcome::Updated { ref file, .. } if file == "vendor-tool-2.0-1.noarch.rpm")
         );
@@ -620,13 +685,13 @@ mod tests {
 
         // Errors and non-RPM content leave the folder untouched.
         origin.lock().unwrap().status = 404;
-        assert!(updater.update(&url).await.is_err());
+        assert!(updater.update(&url.clone().into()).await.is_err());
         {
             let mut o = origin.lock().unwrap();
             o.status = 200;
             o.body = b"<html>oops</html>".to_vec();
         }
-        assert!(updater.update(&url).await.is_err());
+        assert!(updater.update(&url.clone().into()).await.is_err());
         assert_eq!(
             files(dir.path()),
             [
@@ -638,7 +703,7 @@ mod tests {
         // A deleted stored copy is downloaded again.
         origin.lock().unwrap().body = v2.clone();
         std::fs::remove_file(dir.path().join("vendor-tool-2.0-1.noarch.rpm")).unwrap();
-        let out = updater.update(&url).await.unwrap();
+        let out = updater.update(&url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Updated { .. }));
     }
 
@@ -818,5 +883,79 @@ mod tests {
         gh.lock().unwrap().release = release("v3.0", &[("notes.txt", b"x".to_vec())]);
         assert!(!updater.update_all().await);
         assert_eq!(files(&downloads).len(), 3);
+    }
+
+    #[test]
+    fn post_option_parsing() {
+        let sources = parse_sources(
+            "https://vendor.example/dl/tool.rpm post=accept_license_agreement=accepted&submit=Download\n\
+             https://vendor.example/a.rpm bogus=1\n\
+             https://vendor.example/b.rpm post=\n\
+             https://github.com/cli/cli post=x=1\n",
+        );
+        assert_eq!(
+            sources,
+            [Source::Url(Request {
+                url: Url::parse("https://vendor.example/dl/tool.rpm").unwrap(),
+                form: Some("accept_license_agreement=accepted&submit=Download".into()),
+            })]
+        );
+        assert_eq!(
+            sources[0].to_string(),
+            "https://vendor.example/dl/tool.rpm (POST)"
+        );
+    }
+
+    /// Like SEGGER: GET returns an HTML license page, POSTing the
+    /// acceptance form returns the package.
+    async fn license_handler(
+        State(rpm): State<Arc<Vec<u8>>>,
+        method: axum::http::Method,
+        headers: HeaderMap,
+        body: String,
+    ) -> Response {
+        let form = headers
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|ct| ct == "application/x-www-form-urlencoded");
+        if method == axum::http::Method::POST && form && body == "accept_license_agreement=accepted"
+        {
+            return rpm.as_ref().clone().into_response();
+        }
+        axum::response::Html("<html><form method=\"post\">accept?</form></html>").into_response()
+    }
+
+    #[tokio::test]
+    async fn license_form_is_posted() {
+        let app = Router::new()
+            .route("/dl/tool.rpm", get(license_handler).post(license_handler))
+            .with_state(Arc::new(testutil::build_rpm("vendor-tool", "3.0", &[])));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/dl/tool.rpm",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let updater = Updater::new(dir.path().join("sources"), dir.path().to_owned()).unwrap();
+
+        // A plain GET gets the HTML page, which is rejected with a hint.
+        let err = updater.update(&url.clone().into()).await.unwrap_err();
+        assert!(err.to_string().contains("post="), "{err:#}");
+        assert!(files(dir.path()).is_empty());
+
+        let req = Request {
+            url,
+            form: Some("accept_license_agreement=accepted".into()),
+        };
+        let out = updater.update(&req).await.unwrap();
+        assert!(
+            matches!(out, Outcome::Updated { ref file, .. } if file == "vendor-tool-3.0-1.noarch.rpm")
+        );
+        assert!(matches!(
+            updater.update(&req).await.unwrap(),
+            Outcome::Unchanged { .. }
+        ));
     }
 }

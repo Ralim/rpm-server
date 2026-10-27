@@ -89,6 +89,15 @@ https://github.com/cli/cli
 
 A GitHub project URL (`https://github.com/<owner>/<repo>`, optionally ending in `.git`, `/releases` or `/releases/latest`) is resolved on each run to the release marked "Latest" on GitHub (drafts and pre-releases are skipped). All of its `.rpm` assets are then downloaded, every architecture included; dnf installs the one matching the client. Any other URL, including a direct link to a release asset, is downloaded as a single RPM.
 
+Some vendors (e.g. SEGGER) answer the download URL with an HTML license page whose form posts back to the same URL. Add the form's fields after the URL as `post=<url-encoded form data>` to download by submitting it. You are accepting the license on your own behalf:
+
+```text
+# SEGGER J-Link
+https://www.segger.com/downloads/jlink/JLink_Linux_x86_64.rpm post=accept_license_agreement=accepted&submit=Download+software
+```
+
+Redirects are followed automatically (up to 10). If a source returns an HTML page instead of an RPM, the update fails with a warning, and the stored files stay as they were.
+
 Give the server that file and a writable folder:
 
 ```sh
