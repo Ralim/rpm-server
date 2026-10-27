@@ -1,0 +1,120 @@
+# Tests, then builds the container with podman and publishes it to the GitHub
+# container registry as ghcr.io/<owner>/rpm-server.
+#
+# Tags pushed:
+#   <Cargo.toml version>, sha-<short sha>  on every non-PR run
+#   latest                                 on pushes to main
+# Pushing a git tag requires it to be v<Cargo.toml version>.
+name: Container
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Includes tests/dnf_container.rs, which runs dnf clients via podman.
+      - name: Test
+        run: cargo test --locked
+
+  container:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version and tags
+        id: meta
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rpm-server") | .version')"
+          if [[ -z "$version" || "$version" == null ]]; then
+            echo "::error::Could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Git tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          tags="$version sha-${GITHUB_SHA::7}"
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tags="$tags latest"
+          fi
+          {
+            echo "version=$version"
+            echo "image=$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/rpm-server"
+            echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          tag_args=()
+          for tag in $TAGS; do
+            tag_args+=(--tag "$IMAGE:$tag")
+          done
+          podman build \
+            --file Containerfile \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.description=Serves a folder of RPMs as a dnf repository" \
+            "${tag_args[@]}" \
+            .
+
+      - name: Smoke test image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: podman run --rm "$IMAGE:$VERSION" --version | grep -F "$VERSION"
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_PASSWORD" \
+            | podman login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+          for tag in $TAGS; do
+            podman push "$IMAGE:$tag"
+          done
