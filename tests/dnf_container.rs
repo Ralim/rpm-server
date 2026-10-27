@@ -5,14 +5,16 @@
 
 use std::path::Path;
 use std::process::Output;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rpm::{BuildConfig, CompressionType, Dependency, FileOptions, PackageBuilder};
 use rpm_server::repo::Scanner;
 use rpm_server::server::AppState;
 use rpm_server::signing::{RepoSigner, generate_secret_key};
+use rpm_server::sources::{URL_PREFIX, Updater};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 const FEDORA: &str = "registry.fedoraproject.org/fedora:latest";
 const AMAZON_LINUX: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
@@ -197,4 +199,109 @@ echo "GREETING: $(hello-rpmserve)"
     );
     let output = podman_run(FEDORA, &script).await;
     assert_installed(&output);
+}
+
+/// A vendor-style package whose binary prints its version.
+fn vendor_rpm(version: &str) -> Vec<u8> {
+    let mut b = PackageBuilder::new("vendor-tool", version, "MIT", "noarch", "Vendor tool");
+    b.using_config(BuildConfig::v4().compression(CompressionType::Gzip))
+        .release("1")
+        .with_file_contents(
+            format!("#!/bin/sh\necho vendor-tool {version}\n"),
+            FileOptions::new("/usr/bin/vendor-tool").permissions(0o755),
+        )
+        .unwrap();
+    let mut bytes = Vec::new();
+    b.build().unwrap().write(&mut bytes).unwrap();
+    bytes
+}
+
+/// Serves the current contents of `body` at `/latest.rpm`, like a vendor's
+/// "latest" download link.
+async fn start_origin(body: Arc<Mutex<Vec<u8>>>) -> String {
+    let app = axum::Router::new().route(
+        "/latest.rpm",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move { body.lock().unwrap().clone() }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/latest.rpm")
+}
+
+async fn wait_for(state: &AppState, path: &str) {
+    for _ in 0..100 {
+        if state.repo().get(path).is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{path} never appeared in the repository");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fedora_dnf5_installs_and_upgrades_downloaded_source() {
+    let origin_body = Arc::new(Mutex::new(vendor_rpm("1.0")));
+    let origin_url = start_origin(origin_body.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (rpms, downloads) = (tmp.path().join("rpms"), tmp.path().join("downloads"));
+    std::fs::create_dir(&rpms).unwrap();
+    let sources = tmp.path().join("sources.list");
+    std::fs::write(&sources, format!("# vendor\n{origin_url}\n")).unwrap();
+
+    let asc = generate_secret_key("rpm-server e2e <e2e@example.invalid>", None).unwrap();
+    let signer = Arc::new(RepoSigner::from_armored(&asc, None, true).unwrap());
+    let updater = Updater::new(sources, downloads.clone()).unwrap();
+    let mut scanner = Scanner::new(rpms, Some(signer)).with_extra_root(URL_PREFIX, downloads);
+    let repo = tokio::task::spawn_blocking(move || {
+        let repo = scanner.scan().unwrap().unwrap();
+        (scanner, repo)
+    })
+    .await
+    .unwrap();
+    let (scanner, repo) = repo;
+    assert_eq!(repo.package_count, 0);
+    let state = AppState::new(repo, REPO_ID.into(), None);
+    let trigger = Arc::new(Notify::new());
+    rpm_server::spawn_rescan(scanner, state.clone(), None, trigger.clone());
+
+    assert!(updater.update_all().await);
+    trigger.notify_one();
+    wait_for(&state, "downloaded/vendor-tool-1.0-1.noarch.rpm").await;
+
+    *origin_body.lock().unwrap() = vendor_rpm("2.0");
+    assert!(updater.update_all().await);
+    assert!(
+        !updater.update_all().await,
+        "unchanged source is not stored again"
+    );
+    trigger.notify_one();
+    wait_for(&state, "downloaded/vendor-tool-2.0-1.noarch.rpm").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(rpm_server::serve(listener, state, async {
+        let _ = rx.await;
+    }));
+
+    let script = format!(
+        r#"set -ex
+curl -fsS -o /etc/yum.repos.d/{REPO_ID}.repo {base_url}/{REPO_ID}.repo
+dnf -y --disablerepo='*' --enablerepo={REPO_ID} install vendor-tool-1.0
+echo "FIRST: $(vendor-tool)"
+dnf -y --disablerepo='*' --enablerepo={REPO_ID} upgrade vendor-tool
+echo "SECOND: $(vendor-tool)"
+"#
+    );
+    let output = podman_run(FEDORA, &script).await;
+    let _ = tx.send(());
+    assert!(output.status.success(), "container script failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST: vendor-tool 1.0"));
+    assert!(stdout.contains("SECOND: vendor-tool 2.0"));
 }

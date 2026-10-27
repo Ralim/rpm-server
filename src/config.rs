@@ -45,8 +45,10 @@ pub struct Config {
     #[arg(long, env = "RPM_SERVER_NO_PACKAGE_SIGNING")]
     pub no_package_signing: bool,
 
-    /// Seconds between directory rescans; 0 disables rescanning.
-    #[arg(long, env = "RPM_SERVER_RESCAN_INTERVAL", default_value_t = 30)]
+    /// Seconds between full folder rescans; 0 disables them. Changes are
+    /// normally picked up immediately via filesystem watching; this is the
+    /// fallback for filesystems where that does not work (e.g. NFS).
+    #[arg(long, env = "RPM_SERVER_RESCAN_INTERVAL", default_value_t = 3600)]
     pub rescan_interval: u64,
 
     /// Repository id used in the generated `<id>.repo` file.
@@ -56,6 +58,19 @@ pub struct Config {
     /// Public base URL for the generated .repo file (default: from request headers).
     #[arg(long, env = "RPM_SERVER_BASE_URL")]
     pub base_url: Option<String>,
+
+    /// File listing URLs of RPMs to download, one per line (`#` comments allowed).
+    #[arg(long, env = "RPM_SERVER_SOURCES_FILE", requires = "download_dir")]
+    pub sources_file: Option<PathBuf>,
+
+    /// Writable folder for downloaded RPMs, served under /downloaded/.
+    /// Must not be inside --dir.
+    #[arg(long, env = "RPM_SERVER_DOWNLOAD_DIR")]
+    pub download_dir: Option<PathBuf>,
+
+    /// Seconds between source downloads (they also run at startup).
+    #[arg(long, env = "RPM_SERVER_UPDATE_INTERVAL", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(1..))]
+    pub update_interval: u64,
 }
 
 fn parse_repo_id(s: &str) -> Result<String, String> {
@@ -90,6 +105,31 @@ impl Config {
             .with_context(|| format!("loading signing key {}", path.display()))?;
         Ok(Some(Arc::new(signer)))
     }
+
+    /// Creates the download folder and checks it does not overlap `dir`,
+    /// which would list its packages twice.
+    pub fn prepare_download_dir(&self) -> Result<Option<PathBuf>> {
+        let Some(download) = &self.download_dir else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(download)
+            .with_context(|| format!("creating download folder {}", download.display()))?;
+        let download = download
+            .canonicalize()
+            .with_context(|| format!("resolving {}", download.display()))?;
+        let dir = self
+            .dir
+            .canonicalize()
+            .with_context(|| format!("resolving {}", self.dir.display()))?;
+        if download.starts_with(&dir) || dir.starts_with(&download) {
+            anyhow::bail!(
+                "download folder {} must not overlap the package folder {}",
+                download.display(),
+                dir.display()
+            );
+        }
+        Ok(Some(download))
+    }
 }
 
 #[cfg(test)]
@@ -102,9 +142,44 @@ mod tests {
         let c = Config::try_parse_from(["rpm-server"]).unwrap();
         assert_eq!(c.dir, PathBuf::from("/srv/rpms"));
         assert_eq!(c.listen.port(), 8080);
-        assert_eq!(c.rescan_interval, 30);
+        assert_eq!(c.rescan_interval, 3600);
         assert_eq!(c.repo_id, "rpm-server");
+        assert_eq!(c.update_interval, 86400);
         assert!(c.load_signer().unwrap().is_none());
+        assert!(c.prepare_download_dir().unwrap().is_none());
+    }
+
+    #[test]
+    fn sources_file_requires_download_dir() {
+        assert!(Config::try_parse_from(["rpm-server", "--sources-file", "/x"]).is_err());
+        assert!(
+            Config::try_parse_from(["rpm-server", "--sources-file", "/x", "--download-dir", "/y"])
+                .is_ok()
+        );
+        assert!(Config::try_parse_from(["rpm-server", "--update-interval", "0"]).is_err());
+    }
+
+    #[test]
+    fn download_dir_must_not_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("rpms");
+        std::fs::create_dir(&main).unwrap();
+        let parse = |download: &std::path::Path| {
+            Config::try_parse_from([
+                "rpm-server".as_ref(),
+                "--dir".as_ref(),
+                main.as_os_str(),
+                "--download-dir".as_ref(),
+                download.as_os_str(),
+            ])
+            .unwrap()
+        };
+        assert!(parse(&main.join("online")).prepare_download_dir().is_err());
+        assert!(parse(tmp.path()).prepare_download_dir().is_err());
+        let ok = parse(&tmp.path().join("downloads"))
+            .prepare_download_dir()
+            .unwrap();
+        assert!(ok.unwrap().is_dir());
     }
 
     #[test]

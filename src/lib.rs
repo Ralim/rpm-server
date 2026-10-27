@@ -7,8 +7,10 @@ pub mod repo;
 pub mod repodata;
 pub mod server;
 pub mod signing;
+pub mod sources;
 #[cfg(test)]
 mod testutil;
+pub mod watch;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -16,22 +18,43 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::repo::Scanner;
 use crate::server::AppState;
+use crate::sources::Updater;
 
-/// Periodically rescans the package directory and swaps in new snapshots.
-pub fn spawn_rescan(scanner: Scanner, state: Arc<AppState>, every: Duration) -> JoinHandle<()> {
+/// Rescans the package folders every `every` (if set) and whenever
+/// `trigger` is notified, swapping in new snapshots.
+pub fn spawn_rescan(
+    scanner: Scanner,
+    state: Arc<AppState>,
+    every: Option<Duration>,
+    trigger: Arc<Notify>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut scanner = Some(scanner);
-        let mut ticker = tokio::time::interval(every);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
+        let mut ticker = every.map(|every| {
+            let mut t = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t
+        });
         loop {
-            ticker.tick().await;
+            let tick = async {
+                match &mut ticker {
+                    Some(t) => {
+                        t.tick().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = tick => {},
+                () = trigger.notified() => {},
+            }
             let Some(mut s) = scanner.take() else { return };
             let joined = tokio::task::spawn_blocking(move || {
                 let result = s.scan();
@@ -51,6 +74,22 @@ pub fn spawn_rescan(scanner: Scanner, state: Arc<AppState>, every: Duration) -> 
                     error!("rescan task panicked, rescanning disabled: {err}");
                     return;
                 }
+            }
+        }
+    })
+}
+
+/// Downloads sources immediately and then every `every`, notifying
+/// `on_change` when a new package was stored.
+pub fn spawn_updater(updater: Updater, every: Duration, on_change: Arc<Notify>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            info!("updating online sources");
+            if updater.update_all().await {
+                on_change.notify_one();
             }
         }
     })
@@ -104,9 +143,14 @@ pub async fn run(config: Config) -> Result<()> {
         None => info!("no signing key configured; serving packages unmodified"),
     }
 
+    let download_dir = config.prepare_download_dir()?;
     let dir = config.dir.clone();
+    let scan_download_dir = download_dir.clone();
     let (scanner, repo) = tokio::task::spawn_blocking(move || {
         let mut scanner = Scanner::new(dir, signer);
+        if let Some(d) = scan_download_dir {
+            scanner = scanner.with_extra_root(sources::URL_PREFIX, d);
+        }
         let repo = scanner.scan()?;
         anyhow::Ok((scanner, repo))
     })
@@ -114,11 +158,23 @@ pub async fn run(config: Config) -> Result<()> {
     let repo = repo.context("initial scan produced no repository")?;
     let state = AppState::new(repo, config.repo_id.clone(), config.base_url.clone());
 
-    if config.rescan_interval > 0 {
-        spawn_rescan(
-            scanner,
-            state.clone(),
-            Duration::from_secs(config.rescan_interval),
+    let rescan_trigger = Arc::new(Notify::new());
+    let every = (config.rescan_interval > 0).then(|| Duration::from_secs(config.rescan_interval));
+    spawn_rescan(scanner, state.clone(), every, rescan_trigger.clone());
+
+    let mut watch_roots = vec![config.dir.clone()];
+    watch_roots.extend(download_dir.clone());
+    match watch::spawn_watcher(watch_roots, rescan_trigger.clone(), watch::DEBOUNCE) {
+        Ok(_) => info!("watching package folders for changes"),
+        Err(err) => warn!("filesystem watching unavailable, relying on periodic rescans: {err:#}"),
+    }
+
+    if let (Some(sources_file), Some(download_dir)) = (config.sources_file.clone(), download_dir) {
+        let updater = Updater::new(sources_file, download_dir)?;
+        spawn_updater(
+            updater,
+            Duration::from_secs(config.update_interval),
+            rescan_trigger,
         );
     }
 
@@ -128,4 +184,40 @@ pub async fn run(config: Config) -> Result<()> {
     info!(addr = %listener.local_addr()?, dir = %config.dir.display(), "listening");
     serve(listener, state, shutdown_signal()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn wait_for(state: &AppState, path: &str, present: bool) {
+        for _ in 0..100 {
+            if state.repo().get(path).is_some() == present {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("{path} present={present} never observed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watched_changes_reach_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut scanner = Scanner::new(root.clone(), None);
+        let repo = scanner.scan().unwrap().unwrap();
+        let state = AppState::new(repo, "test".into(), None);
+        let trigger = Arc::new(Notify::new());
+        // No periodic rescans: only the watcher can cause updates.
+        spawn_rescan(scanner, state.clone(), None, trigger.clone());
+        let _watch =
+            watch::spawn_watcher(vec![root.clone()], trigger, Duration::from_millis(200)).unwrap();
+
+        std::fs::create_dir(root.join("new")).unwrap();
+        std::fs::write(root.join("new/a.rpm"), testutil::build_rpm("a", "1.0", &[])).unwrap();
+        wait_for(&state, "new/a.rpm", true).await;
+
+        std::fs::remove_file(root.join("new/a.rpm")).unwrap();
+        wait_for(&state, "new/a.rpm", false).await;
+    }
 }

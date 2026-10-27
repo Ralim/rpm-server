@@ -17,19 +17,38 @@ pgp = "=0.20.0"
 quick-xml = "0.42.0"
 # pgp 0.20 uses rand 0.8's RNG traits.
 rand = "0.8"
-rpm = { version = "0.30.2", default-features = false, features = ["signature-pgp"] }
+rpm = { version = "0.30.2", default-features = false, features = [
+  "signature-pgp",
+] }
+# rustls with ring (no cmake/clang needed) and bundled roots, as the
+# scratch image has no CA store.
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "rustls-no-provider",
+  "http2",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 sha2 = "0.11.1"
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-root-certs = "1"
+notify = "8.2.1"
 
 [dev-dependencies]
 http-body-util = "0.1.5"
 # Tests build RPMs in memory, which needs the payload builder.
-rpm = { version = "0.30.2", default-features = false, features = ["signature-pgp", "payload", "gzip-compression"] }
-tempfile = "3.27.0"
+rpm = { version = "0.30.2", default-features = false, features = [
+  "signature-pgp",
+  "payload",
+  "gzip-compression",
+] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
