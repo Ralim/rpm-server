@@ -72,6 +72,20 @@ pub struct Config {
     #[arg(long, env = "RPM_SERVER_UPDATE_INTERVAL", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(1..))]
     pub update_interval: u64,
 
+    /// GitHub token for looking up releases of GitHub sources (raises the
+    /// API rate limit; no scopes needed for public repositories).
+    #[arg(
+        long,
+        env = "RPM_SERVER_GITHUB_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "github_token_file"
+    )]
+    pub github_token: Option<String>,
+
+    /// File containing the GitHub token.
+    #[arg(long, env = "RPM_SERVER_GITHUB_TOKEN_FILE")]
+    pub github_token_file: Option<PathBuf>,
+
     /// Query the health endpoint of the server on --listen and exit
     /// (0 healthy, 1 unhealthy) instead of starting a server.
     #[arg(long)]
@@ -90,6 +104,15 @@ fn parse_repo_id(s: &str) -> Result<String, String> {
 }
 
 impl Config {
+    /// The GitHub token from `--github-token` or `--github-token-file`.
+    pub fn github_token(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.github_token_file {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading GitHub token file {}", path.display()))?;
+            return Ok(Some(raw.trim().to_owned()));
+        }
+        Ok(self.github_token.clone())
+    }
     fn passphrase(&self) -> Result<Option<String>> {
         if let Some(path) = &self.gpg_passphrase_file {
             let raw = std::fs::read_to_string(path)
@@ -152,6 +175,33 @@ mod tests {
         assert_eq!(c.update_interval, 86400);
         assert!(c.load_signer().unwrap().is_none());
         assert!(c.prepare_download_dir().unwrap().is_none());
+    }
+
+    #[test]
+    fn github_token_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "ghp_abc\n").unwrap();
+        let c = Config::try_parse_from([
+            "rpm-server".as_ref(),
+            "--github-token-file".as_ref(),
+            file.as_os_str(),
+        ])
+        .unwrap();
+        assert_eq!(c.github_token().unwrap().as_deref(), Some("ghp_abc"));
+
+        let c = Config::try_parse_from(["rpm-server", "--github-token", "ghp_x"]).unwrap();
+        assert_eq!(c.github_token().unwrap().as_deref(), Some("ghp_x"));
+        assert!(
+            Config::try_parse_from([
+                "rpm-server",
+                "--github-token",
+                "a",
+                "--github-token-file",
+                "/x"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

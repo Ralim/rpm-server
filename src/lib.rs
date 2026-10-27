@@ -179,7 +179,8 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     if let (Some(sources_file), Some(download_dir)) = (config.sources_file.clone(), download_dir) {
-        let updater = Updater::new(sources_file, download_dir)?;
+        let updater =
+            Updater::new(sources_file, download_dir)?.with_github_token(config.github_token()?);
         spawn_updater(
             updater,
             Duration::from_secs(config.update_interval),

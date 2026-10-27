@@ -77,12 +77,17 @@ Back up `key.asc`, the passphrase, and the revocation certificate gpg writes to 
 
 ### Online sources
 
-Some vendors publish an RPM at a fixed "latest" URL. List these URLs in a file, one per line (`#` starts a comment):
+Some vendors publish an RPM at a fixed "latest" URL; others attach RPMs to GitHub releases. List the URLs in a file, one per line (`#` starts a comment):
 
 ```text
 # AWS Session Manager plugin
 https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm
+
+# GitHub CLI: every .rpm attached to the latest release
+https://github.com/cli/cli
 ```
+
+A GitHub project URL (`https://github.com/<owner>/<repo>`, optionally ending in `.git`, `/releases` or `/releases/latest`) is resolved on each run to the release marked "Latest" on GitHub (drafts and pre-releases are skipped). All of its `.rpm` assets are then downloaded, every architecture included; dnf installs the one matching the client. Any other URL, including a direct link to a release asset, is downloaded as a single RPM.
 
 Give the server that file and a writable folder:
 
@@ -104,6 +109,7 @@ How downloads work:
 - **Storage:** changed content is checked to be a valid RPM and saved as `name-version-release.arch.rpm`. Older versions are kept, so clients can still downgrade.
 - **Serving:** downloaded packages appear under `/downloaded/` and in the repo metadata (signed like the others when a key is configured). They show up as soon as a download finishes, without waiting for the next rescan.
 - **Failures:** if a download fails or isn't an RPM, a warning is logged and the stored files stay as they were.
+- **GitHub rate limit:** release lookups use the GitHub API, which allows 60 unauthenticated requests per hour per IP. That is plenty for a daily refresh, but a shared NAT address can exhaust it. Set `RPM_SERVER_GITHUB_TOKEN` (or `RPM_SERVER_GITHUB_TOKEN_FILE`) to a token; for public repositories it needs no scopes. The token is only sent to the API, never to the asset download hosts.
 
 ### Client setup
 
@@ -128,9 +134,10 @@ Every flag (see `rpm-server --help`) has an environment variable:
 | `RPM_SERVER_RESCAN_INTERVAL`                                   | `3600`         | Seconds between full folder rescans (`0` disables); a fallback for changes the watcher misses |
 | `RPM_SERVER_REPO_ID`                                           | `rpm-server`   | Repo id and name of the served `<id>.repo` file                                               |
 | `RPM_SERVER_BASE_URL`                                          | from `Host`    | Public URL written into the `.repo` file                                                      |
-| `RPM_SERVER_SOURCES_FILE`                                      |                | File of RPM URLs to download (needs a download folder)                                        |
+| `RPM_SERVER_SOURCES_FILE`                                      |                | File of RPM or GitHub project URLs to download (needs a download folder)                      |
 | `RPM_SERVER_DOWNLOAD_DIR`                                      |                | Writable folder for downloads, served under `/downloaded/`; must not overlap `RPM_SERVER_DIR` |
 | `RPM_SERVER_UPDATE_INTERVAL`                                   | `86400`        | Seconds between source downloads                                                              |
+| `RPM_SERVER_GITHUB_TOKEN` / `RPM_SERVER_GITHUB_TOKEN_FILE`     |                | Optional GitHub token for release lookups (raises the API rate limit)                         |
 | `RUST_LOG`                                                     | `info`         | Log filter (`tower_http=debug` logs requests)                                                 |
 
 Ed25519 and RSA keys both work on EL9 / AL2023 / Fedora. Use RSA for EL7 / Amazon Linux 2 clients.

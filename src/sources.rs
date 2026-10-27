@@ -1,16 +1,19 @@
-//! Keeps a writable folder in sync with RPMs published at fixed URLs
-//! (e.g. a vendor's "latest" download link).
+//! Keeps a writable folder in sync with RPMs published online: at fixed URLs
+//! (e.g. a vendor's "latest" download link), or as assets of a GitHub
+//! project's latest release.
 //!
 //! Each URL is fetched; if the content hash differs from the last stored
 //! copy, the package header is read and the file is stored as
 //! `name-version-release.arch.rpm`. Previous versions are kept.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::{StatusCode, Url, header};
 use rpm::PackageMetadata;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -20,15 +23,69 @@ pub const URL_PREFIX: &str = "downloaded";
 /// Per-URL state (hash, stored file, ETag); hidden so the scanner skips it.
 const STATE_DIR: &str = ".sources";
 const MAX_DOWNLOAD_BYTES: u64 = 4 << 30;
+const GITHUB_API: &str = "https://api.github.com/";
+
+/// One line of the sources file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A URL serving a single RPM.
+    Url(Url),
+    /// Every `.rpm` asset of a GitHub project's latest release.
+    GitHubLatest { owner: String, repo: String },
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Source::Url(url) => write!(f, "{url}"),
+            Source::GitHubLatest { owner, repo } => write!(f, "github:{owner}/{repo}"),
+        }
+    }
+}
+
+fn is_github_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+impl Source {
+    /// GitHub project pages (`https://github.com/<owner>/<repo>`, optionally
+    /// with `.git`, `/releases` or `/releases/latest`) select the latest
+    /// release; any other URL, including direct release asset links, is
+    /// downloaded as is.
+    fn from_url(url: Url) -> Self {
+        let is_github = matches!(url.host_str(), Some("github.com" | "www.github.com"));
+        let segments: Vec<&str> = url
+            .path_segments()
+            .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+            .unwrap_or_default();
+        if is_github
+            && url.query().is_none()
+            && let [owner, repo, rest @ ..] = segments.as_slice()
+            && matches!(rest, [] | ["releases"] | ["releases", "latest"])
+        {
+            let repo = repo.strip_suffix(".git").unwrap_or(repo);
+            if is_github_name(owner) && is_github_name(repo) {
+                return Source::GitHubLatest {
+                    owner: (*owner).to_owned(),
+                    repo: repo.to_owned(),
+                };
+            }
+        }
+        Source::Url(url)
+    }
+}
 
 /// Parses a sources file: one http(s) URL per line, `#` comments and blank
 /// lines ignored. Invalid lines are logged and skipped.
-pub fn parse_sources(text: &str) -> Vec<Url> {
+pub fn parse_sources(text: &str) -> Vec<Source> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|line| match Url::parse(line) {
-            Ok(url) if matches!(url.scheme(), "http" | "https") => Some(url),
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Some(Source::from_url(url)),
             Ok(_) => {
                 warn!(line, "ignoring source with unsupported URL scheme");
                 None
@@ -39,6 +96,18 @@ pub fn parse_sources(text: &str) -> Vec<Url> {
             }
         })
         .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +187,8 @@ pub struct Updater {
     client: reqwest::Client,
     sources_file: PathBuf,
     dir: PathBuf,
+    github_api: Url,
+    github_token: Option<String>,
 }
 
 impl Updater {
@@ -145,7 +216,62 @@ impl Updater {
             client,
             sources_file,
             dir,
+            github_api: Url::parse(GITHUB_API).expect("valid constant URL"),
+            github_token: None,
         })
+    }
+
+    /// Token for GitHub API requests, raising the unauthenticated rate limit
+    /// of 60 requests per hour.
+    pub fn with_github_token(mut self, token: Option<String>) -> Self {
+        self.github_token = token.filter(|t| !t.trim().is_empty());
+        self
+    }
+
+    /// Overrides the GitHub API base URL (must end with `/`).
+    pub fn with_github_api(mut self, base: Url) -> Self {
+        self.github_api = base;
+        self
+    }
+
+    /// Returns the latest release's tag and the download URLs of its `.rpm` assets.
+    async fn latest_release_rpms(&self, owner: &str, repo: &str) -> Result<(String, Vec<Url>)> {
+        let api = self
+            .github_api
+            .join(&format!("repos/{owner}/{repo}/releases/latest"))?;
+        let mut request = self
+            .client
+            .get(api)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = &self.github_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.context("GitHub API request failed")?;
+        match response.status() {
+            StatusCode::NOT_FOUND => {
+                bail!("no published release found (or the repository does not exist)")
+            }
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => bail!(
+                "GitHub API refused the request ({}); the rate limit may be exhausted, \
+                 set RPM_SERVER_GITHUB_TOKEN to raise it",
+                response.status()
+            ),
+            _ => {}
+        }
+        let body = response.error_for_status()?.bytes().await?;
+        let release: GitHubRelease =
+            serde_json::from_slice(&body).context("parsing GitHub release")?;
+        let urls = release
+            .assets
+            .iter()
+            .filter(|a| a.name.to_ascii_lowercase().ends_with(".rpm"))
+            .map(|a| {
+                Url::parse(&a.browser_download_url)
+                    .with_context(|| format!("invalid download URL for asset {}", a.name))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((release.tag_name, urls))
     }
 
     fn state_path(&self, url: &Url) -> PathBuf {
@@ -172,14 +298,37 @@ impl Updater {
             }
         };
         let mut changed = false;
-        for url in parse_sources(&text) {
-            match self.update(&url).await {
-                Ok(Outcome::Updated { file, nevra }) => {
-                    info!(%url, file, nevra, "stored new package from source");
-                    changed = true;
+        for source in parse_sources(&text) {
+            let urls = match &source {
+                Source::Url(url) => vec![url.clone()],
+                Source::GitHubLatest { owner, repo } => {
+                    match self.latest_release_rpms(owner, repo).await {
+                        Ok((tag, urls)) => {
+                            if urls.is_empty() {
+                                warn!(%source, tag, "latest release has no .rpm assets");
+                            } else {
+                                info!(%source, tag, assets = urls.len(), "found latest release");
+                            }
+                            urls
+                        }
+                        Err(err) => {
+                            warn!(%source, "source update failed: {err:#}");
+                            continue;
+                        }
+                    }
                 }
-                Ok(Outcome::Unchanged { file }) => info!(%url, file, "source unchanged"),
-                Err(err) => warn!(%url, "source update failed: {err:#}"),
+            };
+            for url in urls {
+                match self.update(&url).await {
+                    Ok(Outcome::Updated { file, nevra }) => {
+                        info!(%source, %url, file, nevra, "stored new package from source");
+                        changed = true;
+                    }
+                    Ok(Outcome::Unchanged { file }) => {
+                        info!(%source, %url, file, "source unchanged")
+                    }
+                    Err(err) => warn!(%source, %url, "source update failed: {err:#}"),
+                }
             }
         }
         changed
@@ -331,14 +480,57 @@ mod tests {
 
     #[test]
     fn sources_file_parsing() {
-        let urls = parse_sources(
-            "# vendor packages\n\n  https://example.com/a.rpm  \nftp://example.com/b.rpm\nnot a url\nhttp://example.com/c.rpm\n",
+        let sources = parse_sources(
+            "# vendor packages\n\n  https://example.com/a.rpm  \nftp://example.com/b.rpm\nnot a url\nhttp://example.com/c.rpm\nhttps://github.com/cli/cli\n",
         );
-        let urls: Vec<_> = urls.iter().map(Url::as_str).collect();
+        let shown: Vec<_> = sources.iter().map(ToString::to_string).collect();
         assert_eq!(
-            urls,
-            ["https://example.com/a.rpm", "http://example.com/c.rpm"]
+            shown,
+            [
+                "https://example.com/a.rpm",
+                "http://example.com/c.rpm",
+                "github:cli/cli"
+            ]
         );
+    }
+
+    #[test]
+    fn github_url_detection() {
+        let source = |s: &str| Source::from_url(Url::parse(s).unwrap());
+        let gh = |owner: &str, repo: &str| Source::GitHubLatest {
+            owner: owner.into(),
+            repo: repo.into(),
+        };
+        assert_eq!(source("https://github.com/cli/cli"), gh("cli", "cli"));
+        assert_eq!(source("https://github.com/cli/cli/"), gh("cli", "cli"));
+        assert_eq!(source("https://github.com/cli/cli.git"), gh("cli", "cli"));
+        assert_eq!(
+            source("https://www.github.com/a-b/c_d.e"),
+            gh("a-b", "c_d.e")
+        );
+        assert_eq!(
+            source("https://github.com/cli/cli/releases"),
+            gh("cli", "cli")
+        );
+        assert_eq!(
+            source("https://github.com/cli/cli/releases/latest"),
+            gh("cli", "cli")
+        );
+
+        for direct in [
+            "https://github.com/cli/cli/releases/download/v2.0.0/gh_2.0.0_linux_amd64.rpm",
+            "https://github.com/cli/cli/releases/latest/download/gh.rpm",
+            "https://github.com/cli",
+            "https://github.com/cli/cli?tab=readme",
+            "https://github.com/cli/cli/tree/trunk",
+            "https://github.com/cli/%2e%2e",
+            "https://gitlab.com/cli/cli",
+        ] {
+            assert!(
+                matches!(source(direct), Source::Url(_)),
+                "{direct} should be a plain URL"
+            );
+        }
     }
 
     #[test]
@@ -477,5 +669,154 @@ mod tests {
             !updater.update_all().await,
             "missing sources file is not fatal"
         );
+    }
+
+    /// A release tag and its (name, content) assets.
+    type FakeRelease = (String, Vec<(String, Vec<u8>)>);
+
+    /// A fake GitHub serving `releases/latest` for acme/tool plus the asset files.
+    #[derive(Default)]
+    struct FakeGitHub {
+        base: String,
+        /// `None` answers 404.
+        release: Option<FakeRelease>,
+        api_auth: Vec<Option<String>>,
+        asset_hits: Vec<(String, Option<String>)>,
+    }
+
+    fn auth_header(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get(header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    async fn gh_release(State(g): State<Arc<Mutex<FakeGitHub>>>, headers: HeaderMap) -> Response {
+        let mut g = g.lock().unwrap();
+        g.api_auth.push(auth_header(&headers));
+        let Some((tag, assets)) = &g.release else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let assets: Vec<_> = assets
+            .iter()
+            .map(|(name, body)| {
+                serde_json::json!({
+                    "name": name,
+                    "size": body.len(),
+                    "browser_download_url": format!("{}/dl/{tag}/{name}", g.base),
+                })
+            })
+            .collect();
+        axum::Json(serde_json::json!({ "tag_name": tag, "draft": false, "assets": assets }))
+            .into_response()
+    }
+
+    async fn gh_asset(
+        State(g): State<Arc<Mutex<FakeGitHub>>>,
+        axum::extract::Path((tag, name)): axum::extract::Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        let mut g = g.lock().unwrap();
+        g.asset_hits.push((name.clone(), auth_header(&headers)));
+        match &g.release {
+            Some((t, assets)) if *t == tag => match assets.iter().find(|(n, _)| *n == name) {
+                Some((_, body)) => body.clone().into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            },
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    fn release(tag: &str, assets: &[(&str, Vec<u8>)]) -> Option<FakeRelease> {
+        Some((
+            tag.to_owned(),
+            assets
+                .iter()
+                .map(|(n, b)| ((*n).to_owned(), b.clone()))
+                .collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn github_latest_release_assets() {
+        let gh = Arc::new(Mutex::new(FakeGitHub::default()));
+        let app = Router::new()
+            .route("/repos/acme/tool/releases/latest", get(gh_release))
+            .route("/dl/{tag}/{name}", get(gh_asset))
+            .with_state(gh.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        {
+            let mut g = gh.lock().unwrap();
+            g.base = base.clone();
+            g.release = release(
+                "v1.0",
+                &[
+                    (
+                        "tool-1.0.x86_64.rpm",
+                        testutil::build_rpm("tool", "1.0", &[]),
+                    ),
+                    (
+                        "tool-extras-1.0.RPM",
+                        testutil::build_rpm("tool-extras", "1.0", &[]),
+                    ),
+                    ("checksums.txt", b"not a package".to_vec()),
+                ],
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let sources = dir.path().join("sources.list");
+        std::fs::write(&sources, "https://github.com/acme/tool\n").unwrap();
+        let updater = Updater::new(sources, downloads.clone())
+            .unwrap()
+            .with_github_api(Url::parse(&format!("{base}/")).unwrap())
+            .with_github_token(Some("s3cret".into()));
+
+        // Every .rpm asset of the latest release is stored; other assets are not fetched.
+        assert!(updater.update_all().await);
+        assert_eq!(
+            files(&downloads),
+            ["tool-1.0-1.noarch.rpm", "tool-extras-1.0-1.noarch.rpm"]
+        );
+        {
+            let g = gh.lock().unwrap();
+            assert_eq!(g.api_auth, [Some("Bearer s3cret".to_owned())]);
+            let fetched: Vec<_> = g.asset_hits.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(fetched, ["tool-1.0.x86_64.rpm", "tool-extras-1.0.RPM"]);
+            assert!(
+                g.asset_hits.iter().all(|(_, auth)| auth.is_none()),
+                "the API token must not be sent to asset hosts"
+            );
+        }
+
+        // Same release again: nothing new.
+        assert!(!updater.update_all().await);
+
+        // A new release is picked up; packages from older releases are kept.
+        gh.lock().unwrap().release = release(
+            "v2.0",
+            &[(
+                "tool-2.0.x86_64.rpm",
+                testutil::build_rpm("tool", "2.0", &[]),
+            )],
+        );
+        assert!(updater.update_all().await);
+        assert_eq!(
+            files(&downloads),
+            [
+                "tool-1.0-1.noarch.rpm",
+                "tool-2.0-1.noarch.rpm",
+                "tool-extras-1.0-1.noarch.rpm"
+            ]
+        );
+
+        // No release (404) or a release without RPMs changes nothing.
+        gh.lock().unwrap().release = None;
+        assert!(!updater.update_all().await);
+        gh.lock().unwrap().release = release("v3.0", &[("notes.txt", b"x".to_vec())]);
+        assert!(!updater.update_all().await);
+        assert_eq!(files(&downloads).len(), 3);
     }
 }

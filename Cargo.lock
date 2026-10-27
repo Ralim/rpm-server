@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "rpm-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2409,6 +2409,8 @@ dependencies = [
  "reqwest",
  "rpm",
  "rustls",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "tokio",

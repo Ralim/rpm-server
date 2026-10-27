@@ -1,6 +1,6 @@
 [package]
 name = "rpm-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -40,6 +40,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-root-certs = "1"
 notify = "8.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 http-body-util = "0.1.5"
