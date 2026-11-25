@@ -115,8 +115,9 @@ How downloads work:
 
 - **Schedule:** every URL is fetched at startup and then every 24 hours (`RPM_SERVER_UPDATE_INTERVAL`). The sources file is re-read on each run.
 - **Change check:** content is compared by SHA-256 against the last download from that URL. The server also sends the ETag back, so an unchanged file usually isn't downloaded again.
-- **Storage:** changed content is checked to be a valid RPM and saved as `name-version-release.arch.rpm`. Older versions are kept, so clients can still downgrade.
-- **Serving:** downloaded packages appear under `/downloaded/` and in the repo metadata (signed like the others when a key is configured). They show up as soon as a download finishes, without waiting for the next rescan.
+- **Storage:** each source gets its own folder: `github.com_<owner>_<repo>` for GitHub projects, otherwise the URL's host and path plus a short hash (e.g. `s3.amazonaws.com_session-manager-downloads_..._session-manager-plugin-1a2b3c4d`). Changed content is checked to be a valid RPM and saved there as `name-version-release.arch.rpm`.
+- **Cleanup:** after all downloads of a run, each source folder keeps the newest version of every package (per name and arch) plus the 3 versions before it, so clients can still downgrade. Older ones are deleted, except a version a source still serves (e.g. after a vendor rolled back). The folder of a source that failed in that run is left as it is.
+- **Serving:** downloaded packages appear under `/downloaded/<source folder>/` and in the repo metadata (signed like the others when a key is configured). They show up as soon as a download finishes, without waiting for the next rescan.
 - **Failures:** if a download fails or isn't an RPM, a warning is logged and the stored files stay as they were.
 - **GitHub rate limit:** release lookups use the GitHub API, which allows 60 unauthenticated requests per hour per IP. That is plenty for a daily refresh, but a shared NAT address can exhaust it. Set `RPM_SERVER_GITHUB_TOKEN` (or `RPM_SERVER_GITHUB_TOKEN_FILE`) to a token; for public repositories it needs no scopes. The token is only sent to the API, never to the asset download hosts.
 

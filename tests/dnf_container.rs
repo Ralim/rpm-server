@@ -12,7 +12,7 @@ use rpm::{BuildConfig, CompressionType, Dependency, FileOptions, PackageBuilder}
 use rpm_server::repo::Scanner;
 use rpm_server::server::AppState;
 use rpm_server::signing::{RepoSigner, generate_secret_key};
-use rpm_server::sources::{URL_PREFIX, Updater};
+use rpm_server::sources::{URL_PREFIX, Updater, parse_sources};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 
@@ -252,6 +252,7 @@ async fn fedora_dnf5_installs_and_upgrades_downloaded_source() {
     std::fs::create_dir(&rpms).unwrap();
     let sources = tmp.path().join("sources.list");
     std::fs::write(&sources, format!("# vendor\n{origin_url}\n")).unwrap();
+    let folder = parse_sources(&origin_url)[0].folder();
 
     let asc = generate_secret_key("rpm-server e2e <e2e@example.invalid>", None).unwrap();
     let signer = Arc::new(RepoSigner::from_armored(&asc, None, true).unwrap());
@@ -271,7 +272,11 @@ async fn fedora_dnf5_installs_and_upgrades_downloaded_source() {
 
     assert!(updater.update_all().await);
     trigger.notify_one();
-    wait_for(&state, "downloaded/vendor-tool-1.0-1.noarch.rpm").await;
+    wait_for(
+        &state,
+        &format!("downloaded/{folder}/vendor-tool-1.0-1.noarch.rpm"),
+    )
+    .await;
 
     *origin_body.lock().unwrap() = vendor_rpm("2.0");
     assert!(updater.update_all().await);
@@ -280,7 +285,11 @@ async fn fedora_dnf5_installs_and_upgrades_downloaded_source() {
         "unchanged source is not stored again"
     );
     trigger.notify_one();
-    wait_for(&state, "downloaded/vendor-tool-2.0-1.noarch.rpm").await;
+    wait_for(
+        &state,
+        &format!("downloaded/{folder}/vendor-tool-2.0-1.noarch.rpm"),
+    )
+    .await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());

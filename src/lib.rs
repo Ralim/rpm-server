@@ -89,7 +89,7 @@ pub fn spawn_rescan(
 }
 
 /// Downloads sources immediately and then every `every`, notifying
-/// `on_change` when a new package was stored.
+/// `on_change` when a package was stored or removed.
 pub fn spawn_updater(updater: Updater, every: Duration, on_change: Arc<Notify>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(every);

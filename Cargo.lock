@@ -2408,6 +2408,7 @@ dependencies = [
  "rand",
  "reqwest",
  "rpm",
+ "rpm-version",
  "rustls",
  "serde",
  "serde_json",

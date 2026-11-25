@@ -20,6 +20,8 @@ rand = "0.8"
 rpm = { version = "0.30.2", default-features = false, features = [
   "signature-pgp",
 ] }
+# EVR ordering (rpmvercmp); the rpm crate uses it but does not re-export it.
+rpm-version = "0.5"
 # rustls with ring (no cmake/clang needed) and bundled roots, as the
 # scratch image has no CA store.
 reqwest = { version = "0.13.5", default-features = false, features = [

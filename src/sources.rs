@@ -4,8 +4,12 @@
 //!
 //! Each URL is fetched; if the content hash differs from the last stored
 //! copy, the package header is read and the file is stored as
-//! `name-version-release.arch.rpm`. Previous versions are kept.
+//! `<folder>/name-version-release.arch.rpm`, with one folder per source
+//! (see [`Source::folder`]). After each run, packages more than
+//! [`KEEP_PREVIOUS_VERSIONS`] versions behind the newest one of the same name
+//! and arch in their folder are removed.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::{StatusCode, Url, header};
 use rpm::PackageMetadata;
+use rpm_version::Evr;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -24,6 +29,11 @@ pub const URL_PREFIX: &str = "downloaded";
 const STATE_DIR: &str = ".sources";
 const MAX_DOWNLOAD_BYTES: u64 = 4 << 30;
 const GITHUB_API: &str = "https://api.github.com/";
+/// Older versions kept per package (name and arch) in a source folder, next
+/// to the newest one.
+pub const KEEP_PREVIOUS_VERSIONS: usize = 3;
+/// Length limit of the readable part of a URL source's folder name.
+const MAX_SLUG_LEN: usize = 100;
 
 /// A download: a GET, or a POST of a form (e.g. a license acceptance).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +46,18 @@ pub struct Request {
 impl From<Url> for Request {
     fn from(url: Url) -> Self {
         Self { url, form: None }
+    }
+}
+
+impl Request {
+    /// Identifies the download: the URL, plus the form for POST requests.
+    fn key(&self) -> String {
+        let mut key = self.url.as_str().to_owned();
+        if let Some(form) = &self.form {
+            key.push('\n');
+            key.push_str(form);
+        }
+        key
     }
 }
 
@@ -65,7 +87,58 @@ fn is_github_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// A non-hidden folder name made of `[A-Za-z0-9._-]`, with runs of other
+/// characters replaced by `_`.
+fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.truncate(MAX_SLUG_LEN);
+    let slug = out.trim_matches(['_', '.']);
+    if slug.is_empty() {
+        "source".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+/// Whether `name` is a single, visible path component.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\', '\0'])
+}
+
 impl Source {
+    /// Folder of the download folder that holds this source's packages:
+    /// `github.com_<owner>_<repo>` (lowercase, as GitHub names are
+    /// case-insensitive) for GitHub projects, otherwise the URL's
+    /// host and path followed by a hash of the request, which keeps URLs
+    /// with the same readable part apart.
+    pub fn folder(&self) -> String {
+        match self {
+            Source::GitHubLatest { owner, repo } => format!(
+                "github.com_{}_{}",
+                owner.to_ascii_lowercase(),
+                repo.to_ascii_lowercase()
+            ),
+            Source::Url(req) => {
+                let path = req.url.path();
+                let path = path.strip_suffix(".rpm").unwrap_or(path);
+                let host = req.url.host_str().unwrap_or_default();
+                let hash = Sha256::digest(req.key().as_bytes());
+                format!(
+                    "{}-{}",
+                    slugify(&format!("{host}{path}")),
+                    hex::encode(&hash[..4])
+                )
+            }
+        }
+    }
+
     /// GitHub project pages (`https://github.com/<owner>/<repo>`, optionally
     /// with `.git`, `/releases` or `/releases/latest`) select the latest
     /// release; any other URL, including direct release asset links, is
@@ -188,24 +261,134 @@ pub enum Outcome {
     Updated { file: String, nevra: String },
 }
 
+/// A package's name, arch and version, read from its header.
+struct PackageId {
+    name: String,
+    arch: String,
+    evr: Evr<'static>,
+}
+
+impl PackageId {
+    fn read(path: &Path) -> Result<Self> {
+        let m = PackageMetadata::open(path)?;
+        let arch = if m.is_source_package() {
+            "src"
+        } else {
+            m.get_arch()?
+        };
+        let epoch = m.get_epoch().map(|e| e.to_string()).unwrap_or_default();
+        Ok(Self {
+            name: m.get_name()?.to_owned(),
+            arch: arch.to_owned(),
+            evr: Evr::new(
+                epoch,
+                m.get_version()?.to_owned(),
+                m.get_release()?.to_owned(),
+            ),
+        })
+    }
+}
+
 /// Reads the package header and returns (`name-version-release.arch.rpm`, NEVRA).
 fn stored_name(path: &Path) -> Result<(String, String)> {
-    let m = PackageMetadata::open(path).context("downloaded file is not a valid RPM")?;
-    let arch = if m.is_source_package() {
-        "src"
-    } else {
-        m.get_arch()?
-    };
-    let (name, version, release) = (m.get_name()?, m.get_version()?, m.get_release()?);
+    let PackageId { name, arch, evr } =
+        PackageId::read(path).context("downloaded file is not a valid RPM")?;
+    let (version, release) = (evr.version(), evr.release());
     let file = format!("{name}-{version}-{release}.{arch}.rpm");
-    if file.starts_with('.') || file.contains(['/', '\\', '\0']) || file.len() > 255 {
+    if !is_plain_name(&file) || file.len() > 255 {
         bail!("refusing unsafe file name derived from package header: {file:?}");
     }
-    let nevra = match m.get_epoch() {
-        Ok(epoch) if epoch > 0 => format!("{name}-{epoch}:{version}-{release}.{arch}"),
-        _ => format!("{name}-{version}-{release}.{arch}"),
+    let nevra = match evr.epoch() {
+        "" | "0" => format!("{name}-{version}-{release}.{arch}"),
+        epoch => format!("{name}-{epoch}:{version}-{release}.{arch}"),
     };
     Ok((file, nevra))
+}
+
+/// Cleans up the download folder `dir` after an update run, returning
+/// whether any package was removed:
+///
+/// - In each source folder except those in `skip`, packages more than
+///   `keep_previous` versions behind the newest one of the same name and
+///   arch are removed, except those in `current` (paths relative to `dir`
+///   that sources serve now, e.g. after a vendor rolled back).
+/// - State of downloads whose stored file is gone is removed.
+fn prune_downloads(
+    dir: &Path,
+    keep_previous: usize,
+    current: &HashSet<String>,
+    skip: &HashSet<String>,
+) -> Result<bool> {
+    type Group = (String, String, String);
+    let mut groups: BTreeMap<Group, Vec<(String, Evr<'static>)>> = BTreeMap::new();
+    let visible_entries = |path: &Path| -> Result<Vec<(String, std::fs::FileType)>> {
+        let mut out = Vec::new();
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
+        {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str().filter(|n| is_plain_name(n)) {
+                out.push((name.to_owned(), entry.file_type()?));
+            }
+        }
+        Ok(out)
+    };
+
+    for (folder, ft) in visible_entries(dir)? {
+        if !ft.is_dir() || skip.contains(&folder) {
+            continue;
+        }
+        let files = match visible_entries(&dir.join(&folder)) {
+            Ok(files) => files,
+            Err(err) => {
+                warn!(folder, "skipping download folder during cleanup: {err:#}");
+                continue;
+            }
+        };
+        for (file, ft) in files {
+            if !ft.is_file() || !file.ends_with(".rpm") {
+                continue;
+            }
+            let rel = format!("{folder}/{file}");
+            match PackageId::read(&dir.join(&rel)) {
+                Ok(id) => groups
+                    .entry((folder.clone(), id.name, id.arch))
+                    .or_default()
+                    .push((rel, id.evr)),
+                Err(err) => warn!(file = rel, "skipping unreadable download: {err:#}"),
+            }
+        }
+    }
+
+    let mut changed = false;
+    for mut versions in groups.into_values() {
+        versions.sort_by(|a, b| b.1.cmp(&a.1));
+        for (rel, evr) in versions.iter().skip(keep_previous + 1) {
+            if current.contains(rel) {
+                continue;
+            }
+            match std::fs::remove_file(dir.join(rel)) {
+                Ok(()) => {
+                    info!(file = rel, evr = %evr.evr(), "removed old downloaded package");
+                    changed = true;
+                }
+                Err(err) => warn!(file = rel, %err, "cannot remove old downloaded package"),
+            }
+        }
+    }
+
+    if let Ok(states) = std::fs::read_dir(dir.join(STATE_DIR)) {
+        for path in states.flatten().map(|e| e.path()) {
+            let stale = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| SourceState::parse(&t))
+                .is_some_and(|s| !dir.join(&s.file).is_file());
+            if stale && let Err(err) = std::fs::remove_file(&path) {
+                warn!(path = %path.display(), %err, "cannot remove stale download state");
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -316,12 +499,7 @@ impl Updater {
 
     /// State is keyed by URL, plus the form for POST sources.
     fn state_path(&self, req: &Request) -> PathBuf {
-        let mut key = req.url.as_str().to_owned();
-        if let Some(form) = &req.form {
-            key.push('\n');
-            key.push_str(form);
-        }
-        let key = hex::encode(Sha256::digest(key.as_bytes()));
+        let key = hex::encode(Sha256::digest(req.key().as_bytes()));
         self.dir.join(STATE_DIR).join(key)
     }
 
@@ -333,8 +511,9 @@ impl Updater {
         Ok(())
     }
 
-    /// Fetches every URL in the sources file (re-read on each call).
-    /// Returns whether any new package was stored.
+    /// Fetches every URL in the sources file (re-read on each call), then
+    /// removes old versions (see [`prune_downloads`]).
+    /// Returns whether any package was stored or removed.
     pub async fn update_all(&self) -> bool {
         let text = match tokio::fs::read_to_string(&self.sources_file).await {
             Ok(t) => t,
@@ -344,7 +523,12 @@ impl Updater {
             }
         };
         let mut changed = false;
+        let mut current = HashSet::new();
+        // Folders of sources that failed: what they serve now is unknown, so
+        // they are not pruned in this run.
+        let mut failed = HashSet::new();
         for source in parse_sources(&text) {
+            let folder = source.folder();
             let requests = match &source {
                 Source::Url(req) => vec![req.clone()],
                 Source::GitHubLatest { owner, repo } => {
@@ -359,6 +543,7 @@ impl Updater {
                         }
                         Err(err) => {
                             warn!(%source, "source update failed: {err:#}");
+                            failed.insert(folder);
                             continue;
                         }
                     }
@@ -366,28 +551,61 @@ impl Updater {
             };
             for req in requests {
                 let url = &req.url;
-                match self.update(&req).await {
+                match self.update(&folder, &req).await {
                     Ok(Outcome::Updated { file, nevra }) => {
                         info!(%source, %url, file, nevra, "stored new package from source");
+                        current.insert(file);
                         changed = true;
                     }
                     Ok(Outcome::Unchanged { file }) => {
-                        info!(%source, %url, file, "source unchanged")
+                        info!(%source, %url, file, "source unchanged");
+                        current.insert(file);
                     }
-                    Err(err) => warn!(%source, %url, "source update failed: {err:#}"),
+                    Err(err) => {
+                        warn!(%source, %url, "source update failed: {err:#}");
+                        failed.insert(folder.clone());
+                    }
                 }
             }
         }
-        changed
+
+        let dir = self.dir.clone();
+        let pruned = tokio::task::spawn_blocking(move || {
+            prune_downloads(&dir, KEEP_PREVIOUS_VERSIONS, &current, &failed)
+        })
+        .await;
+        match pruned {
+            Ok(Ok(pruned)) => changed || pruned,
+            Ok(Err(err)) => {
+                warn!("cleanup of old downloads failed: {err:#}");
+                changed
+            }
+            Err(err) => {
+                warn!("cleanup of old downloads panicked: {err}");
+                changed
+            }
+        }
     }
 
-    /// Fetches one source and stores its content if it changed.
-    pub async fn update(&self, req: &Request) -> Result<Outcome> {
+    /// Fetches one source and stores its content in `folder` (a single
+    /// folder name, see [`Source::folder`]) if it changed. The returned file
+    /// is relative to the download folder.
+    pub async fn update(&self, folder: &str, req: &Request) -> Result<Outcome> {
+        if !is_plain_name(folder) {
+            bail!("invalid source folder name {folder:?}");
+        }
+        let in_folder = |file: &str| {
+            file.strip_prefix(folder)
+                .and_then(|f| f.strip_prefix('/'))
+                .is_some_and(is_plain_name)
+        };
+        // State pointing outside this folder is treated as absent, so the
+        // package is downloaded into the folder.
         let previous = tokio::fs::read_to_string(self.state_path(req))
             .await
             .ok()
             .and_then(|t| SourceState::parse(&t))
-            .filter(|s| self.dir.join(&s.file).is_file());
+            .filter(|s| in_folder(&s.file) && self.dir.join(&s.file).is_file());
 
         let mut request = match &req.form {
             Some(form) => self
@@ -431,11 +649,15 @@ impl Updater {
             bail!("download exceeds {MAX_DOWNLOAD_BYTES} bytes");
         }
 
+        let folder_path = self.dir.join(folder);
+        tokio::fs::create_dir_all(&folder_path)
+            .await
+            .with_context(|| format!("creating {}", folder_path.display()))?;
         // Hidden name: the scanner ignores it while it is being written.
         let tmp = tempfile::Builder::new()
             .prefix(".download-")
             .suffix(".part")
-            .tempfile_in(&self.dir)?;
+            .tempfile_in(&folder_path)?;
         let mut file = tokio::fs::File::from_std(tmp.reopen()?);
         let mut hasher = Sha256::new();
         let mut size = 0u64;
@@ -457,11 +679,12 @@ impl Updater {
             return Ok(Outcome::Unchanged { file });
         }
 
-        let dir = self.dir.clone();
         let expected = sha256.clone();
+        let folder = folder.to_owned();
         let outcome = tokio::task::spawn_blocking(move || -> Result<Outcome> {
-            let (file, nevra) = stored_name(tmp.path())?;
-            let target = dir.join(&file);
+            let (name, nevra) = stored_name(tmp.path())?;
+            let target = folder_path.join(&name);
+            let file = format!("{folder}/{name}");
             if target.is_file() {
                 if sha256_file(&target)? == expected {
                     return Ok(Outcome::Unchanged { file });
@@ -533,14 +756,259 @@ mod tests {
         Url::parse(&format!("http://{addr}/pkg/latest.rpm")).unwrap()
     }
 
+    /// Visible files under `dir`, as paths relative to it.
     fn files(dir: &Path) -> Vec<String> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| n != STATE_DIR)
-            .collect();
+        fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let child = format!("{rel}{name}");
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), &format!("{child}/"), out);
+                } else {
+                    out.push(child);
+                }
+            }
+        }
+        let mut names = Vec::new();
+        walk(dir, "", &mut names);
         names.sort();
         names
+    }
+
+    /// Writes a test package to `dir/rel`, creating its folder.
+    fn put(dir: &Path, rel: &str, name: &str, version: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, testutil::build_rpm(name, version, &[])).unwrap();
+    }
+
+    #[test]
+    fn source_folder_names() {
+        let folder = |line: &str| parse_sources(line)[0].folder();
+        assert_eq!(folder("https://github.com/cli/cli"), "github.com_cli_cli");
+        assert_eq!(
+            folder("https://www.github.com/cli/cli.git/releases"),
+            "github.com_cli_cli"
+        );
+        assert_eq!(folder("https://github.com/Cli/CLI"), "github.com_cli_cli");
+
+        let plain = folder(
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm",
+        );
+        let (slug, hash) = plain.rsplit_once('-').unwrap();
+        assert_eq!(
+            slug,
+            "s3.amazonaws.com_session-manager-downloads_plugin_latest_linux_64bit_session-manager-plugin"
+        );
+        assert_eq!(hash.len(), 8);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            plain,
+            folder(
+                "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm"
+            ),
+            "folder names are stable"
+        );
+
+        // Same readable part, different requests: different folders.
+        let names = [
+            folder("https://vendor.example/dl/tool.rpm"),
+            folder("https://vendor.example/dl/tool.rpm post=a=1"),
+            folder("https://vendor.example/dl/tool.rpm?arch=arm64"),
+            folder("https://vendor.example/dl_tool.rpm"),
+        ];
+        for (i, a) in names.iter().enumerate() {
+            assert!(a.starts_with("vendor.example_dl_tool-"), "{a}");
+            assert!(names[i + 1..].iter().all(|b| a != b), "{names:?}");
+        }
+
+        let odd = folder("http://[::1]:8080/%7Euser/a%20b.RPM");
+        assert!(odd.starts_with("1_7Euser_a_20b.RPM-"), "{odd}");
+        let long = folder(&format!("https://example.com/{}.rpm", "x".repeat(500)));
+        assert_eq!(long.len(), MAX_SLUG_LEN + 9);
+
+        assert_eq!(slugify(".."), "source");
+        assert_eq!(slugify("_.a//b._"), "a_b");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_unsafe_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let updater = Updater::new(dir.path().join("sources"), dir.path().to_owned()).unwrap();
+        let url = Url::parse("http://127.0.0.1:1/a.rpm").unwrap();
+        for folder in ["", ".sources", "../x", "a/b"] {
+            let err = updater
+                .update(folder, &url.clone().into())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("invalid source folder"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn prune_keeps_three_previous_versions_per_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // Ordered by rpmvercmp, not by name: 1.10 is newer than 1.9.
+        for v in ["1.1", "1.2", "1.9", "1.10", "1.11", "2.0"] {
+            put(d, &format!("a/tool-{v}-1.noarch.rpm"), "tool", v);
+        }
+        // Other packages and folders are counted separately.
+        for v in ["1", "2"] {
+            put(
+                d,
+                &format!("a/tool-extras-{v}-1.noarch.rpm"),
+                "tool-extras",
+                v,
+            );
+        }
+        for v in ["1", "2", "3", "4"] {
+            put(d, &format!("b/tool-{v}-1.noarch.rpm"), "tool", v);
+        }
+        std::fs::write(d.join("a/notes.txt"), "x").unwrap();
+        std::fs::write(d.join("a/broken.rpm"), "not an rpm").unwrap();
+
+        assert!(prune_downloads(d, 3, &HashSet::new(), &HashSet::new()).unwrap());
+        assert_eq!(
+            files(d),
+            [
+                "a/broken.rpm",
+                "a/notes.txt",
+                "a/tool-1.10-1.noarch.rpm",
+                "a/tool-1.11-1.noarch.rpm",
+                "a/tool-1.9-1.noarch.rpm",
+                "a/tool-2.0-1.noarch.rpm",
+                "a/tool-extras-1-1.noarch.rpm",
+                "a/tool-extras-2-1.noarch.rpm",
+                "b/tool-1-1.noarch.rpm",
+                "b/tool-2-1.noarch.rpm",
+                "b/tool-3-1.noarch.rpm",
+                "b/tool-4-1.noarch.rpm",
+            ]
+        );
+        assert!(
+            !prune_downloads(d, 3, &HashSet::new(), &HashSet::new()).unwrap(),
+            "nothing left to prune"
+        );
+    }
+
+    /// Writes a minimal package with an explicit epoch and arch to `dir/rel`.
+    fn put_evra(dir: &Path, rel: &str, epoch: u32, version: &str, arch: &str) {
+        let mut out = Vec::new();
+        rpm::PackageBuilder::new("tool", version, "MIT", arch, "A test package")
+            .using_config(rpm::BuildConfig::v4().compression(rpm::CompressionType::Gzip))
+            .epoch(epoch)
+            .release("1")
+            .build()
+            .unwrap()
+            .write(&mut out)
+            .unwrap();
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn prune_orders_by_epoch_and_groups_by_arch() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // Epoch 1 outranks every epoch 0 version, so 2 is the oldest.
+        put_evra(d, "a/tool-1.0-1.noarch.rpm", 1, "1.0", "noarch");
+        for v in ["2", "3", "4", "5"] {
+            put_evra(d, &format!("a/tool-{v}-1.noarch.rpm"), 0, v, "noarch");
+        }
+        for v in ["1", "2", "3", "4"] {
+            put_evra(d, &format!("a/tool-{v}-1.x86_64.rpm"), 0, v, "x86_64");
+        }
+
+        assert!(prune_downloads(d, 3, &HashSet::new(), &HashSet::new()).unwrap());
+        assert_eq!(
+            files(d),
+            [
+                "a/tool-1-1.x86_64.rpm",
+                "a/tool-1.0-1.noarch.rpm",
+                "a/tool-2-1.x86_64.rpm",
+                "a/tool-3-1.noarch.rpm",
+                "a/tool-3-1.x86_64.rpm",
+                "a/tool-4-1.noarch.rpm",
+                "a/tool-4-1.x86_64.rpm",
+                "a/tool-5-1.noarch.rpm",
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_leaves_hidden_and_skipped_folders_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for folder in [".hidden", "failed"] {
+            for v in ["1", "2", "3", "4", "5", "6"] {
+                put(d, &format!("{folder}/tool-{v}-1.noarch.rpm"), "tool", v);
+            }
+        }
+        let skip = HashSet::from(["failed".to_owned()]);
+        assert!(!prune_downloads(d, 3, &HashSet::new(), &skip).unwrap());
+        assert_eq!(files(&d.join(".hidden")).len(), 6);
+        assert_eq!(files(&d.join("failed")).len(), 6);
+    }
+
+    #[test]
+    fn prune_spares_packages_sources_currently_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for v in ["1", "2", "3", "4", "5", "6"] {
+            put(d, &format!("a/tool-{v}-1.noarch.rpm"), "tool", v);
+        }
+        // The source rolled back to version 1: it must not be deleted and
+        // downloaded again on every run.
+        let current = HashSet::from(["a/tool-1-1.noarch.rpm".to_owned()]);
+        assert!(prune_downloads(d, 3, &current, &HashSet::new()).unwrap());
+        assert_eq!(
+            files(d),
+            [
+                "a/tool-1-1.noarch.rpm",
+                "a/tool-3-1.noarch.rpm",
+                "a/tool-4-1.noarch.rpm",
+                "a/tool-5-1.noarch.rpm",
+                "a/tool-6-1.noarch.rpm",
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_removes_state_of_removed_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir(d.join(STATE_DIR)).unwrap();
+        for v in ["1", "2", "3", "4", "5"] {
+            put(d, &format!("a/tool-{v}-1.noarch.rpm"), "tool", v);
+        }
+        let url = Url::parse("https://example.com/a.rpm").unwrap();
+        let write_state = |key: &str, file: &str| {
+            let state = SourceState {
+                sha256: "00".into(),
+                file: file.into(),
+                etag: None,
+            };
+            std::fs::write(d.join(STATE_DIR).join(key), state.render(&url)).unwrap()
+        };
+        write_state("old", "a/tool-1-1.noarch.rpm");
+        write_state("kept", "a/tool-2-1.noarch.rpm");
+        write_state("gone", "a/deleted-1-1.noarch.rpm");
+        std::fs::write(d.join(STATE_DIR).join("garbage"), "x").unwrap();
+
+        assert!(prune_downloads(d, 3, &HashSet::new(), &HashSet::new()).unwrap());
+        assert!(!d.join("a/tool-1-1.noarch.rpm").exists());
+        let mut states: Vec<_> = std::fs::read_dir(d.join(STATE_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        states.sort();
+        assert_eq!(states, ["garbage", "kept"]);
     }
 
     #[test]
@@ -639,16 +1107,16 @@ mod tests {
         let url = start_origin(origin.clone()).await;
         let updater = Updater::new(dir.path().join("sources"), dir.path().to_owned()).unwrap();
 
-        // First fetch stores the package under its NEVRA-derived name.
-        let out = updater.update(&url.clone().into()).await.unwrap();
+        // First fetch stores the package in the folder under its NEVRA-derived name.
+        let out = updater.update("vendor", &url.clone().into()).await.unwrap();
         assert_eq!(
             out,
             Outcome::Updated {
-                file: "vendor-tool-1.0-1.noarch.rpm".into(),
+                file: "vendor/vendor-tool-1.0-1.noarch.rpm".into(),
                 nevra: "vendor-tool-1.0-1.noarch".into()
             }
         );
-        let stored = dir.path().join("vendor-tool-1.0-1.noarch.rpm");
+        let stored = dir.path().join("vendor/vendor-tool-1.0-1.noarch.rpm");
         assert_eq!(std::fs::read(&stored).unwrap(), v1);
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(&stored).unwrap().permissions(),
@@ -656,13 +1124,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o644);
 
         // Same ETag: answered with 304, nothing downloaded.
-        let out = updater.update(&url.clone().into()).await.unwrap();
+        let out = updater.update("vendor", &url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Unchanged { .. }));
         assert_eq!(origin.lock().unwrap().conditional_hits, 1);
 
         // New ETag but identical bytes: detected by hash.
         origin.lock().unwrap().etag = Some("\"v1-again\"".into());
-        let out = updater.update(&url.clone().into()).await.unwrap();
+        let out = updater.update("vendor", &url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Unchanged { .. }));
 
         // New content: stored alongside the old version.
@@ -671,40 +1139,47 @@ mod tests {
             o.body = v2.clone();
             o.etag = None;
         }
-        let out = updater.update(&url.clone().into()).await.unwrap();
+        let out = updater.update("vendor", &url.clone().into()).await.unwrap();
         assert!(
-            matches!(out, Outcome::Updated { ref file, .. } if file == "vendor-tool-2.0-1.noarch.rpm")
+            matches!(out, Outcome::Updated { ref file, .. } if file == "vendor/vendor-tool-2.0-1.noarch.rpm")
         );
         assert_eq!(
             files(dir.path()),
             [
-                "vendor-tool-1.0-1.noarch.rpm",
-                "vendor-tool-2.0-1.noarch.rpm"
+                "vendor/vendor-tool-1.0-1.noarch.rpm",
+                "vendor/vendor-tool-2.0-1.noarch.rpm"
             ]
         );
 
         // Errors and non-RPM content leave the folder untouched.
         origin.lock().unwrap().status = 404;
-        assert!(updater.update(&url.clone().into()).await.is_err());
+        assert!(updater.update("vendor", &url.clone().into()).await.is_err());
         {
             let mut o = origin.lock().unwrap();
             o.status = 200;
             o.body = b"<html>oops</html>".to_vec();
         }
-        assert!(updater.update(&url.clone().into()).await.is_err());
+        assert!(updater.update("vendor", &url.clone().into()).await.is_err());
         assert_eq!(
             files(dir.path()),
             [
-                "vendor-tool-1.0-1.noarch.rpm",
-                "vendor-tool-2.0-1.noarch.rpm"
+                "vendor/vendor-tool-1.0-1.noarch.rpm",
+                "vendor/vendor-tool-2.0-1.noarch.rpm"
             ]
         );
 
         // A deleted stored copy is downloaded again.
         origin.lock().unwrap().body = v2.clone();
-        std::fs::remove_file(dir.path().join("vendor-tool-2.0-1.noarch.rpm")).unwrap();
-        let out = updater.update(&url.clone().into()).await.unwrap();
+        std::fs::remove_file(dir.path().join("vendor/vendor-tool-2.0-1.noarch.rpm")).unwrap();
+        let out = updater.update("vendor", &url.clone().into()).await.unwrap();
         assert!(matches!(out, Outcome::Updated { .. }));
+
+        // A copy stored in another folder is not reused: the package is
+        // downloaded into this one.
+        let out = updater.update("other", &url.clone().into()).await.unwrap();
+        assert!(
+            matches!(out, Outcome::Updated { ref file, .. } if file == "other/vendor-tool-2.0-1.noarch.rpm")
+        );
     }
 
     #[tokio::test]
@@ -725,9 +1200,24 @@ mod tests {
         .unwrap();
 
         let updater = Updater::new(sources.clone(), downloads.clone()).unwrap();
+        // The unreachable source's folder is not pruned while it fails.
+        let unreachable = parse_sources("http://127.0.0.1:1/unreachable.rpm")[0].folder();
+        for v in ["1", "2", "3", "4", "5"] {
+            put(
+                &downloads,
+                &format!("{unreachable}/old-{v}-1.noarch.rpm"),
+                "old",
+                v,
+            );
+        }
         assert!(updater.update_all().await, "first run stores the package");
         assert!(!updater.update_all().await, "second run finds nothing new");
-        assert_eq!(files(&downloads), ["vendor-tool-1.0-1.noarch.rpm"]);
+        let folder = parse_sources(url.as_str())[0].folder();
+        assert_eq!(
+            files(&downloads.join(&folder)),
+            ["vendor-tool-1.0-1.noarch.rpm"]
+        );
+        assert_eq!(files(&downloads.join(&unreachable)).len(), 5);
 
         std::fs::remove_file(&sources).unwrap();
         assert!(
@@ -843,7 +1333,10 @@ mod tests {
         assert!(updater.update_all().await);
         assert_eq!(
             files(&downloads),
-            ["tool-1.0-1.noarch.rpm", "tool-extras-1.0-1.noarch.rpm"]
+            [
+                "github.com_acme_tool/tool-1.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-extras-1.0-1.noarch.rpm"
+            ]
         );
         {
             let g = gh.lock().unwrap();
@@ -871,9 +1364,9 @@ mod tests {
         assert_eq!(
             files(&downloads),
             [
-                "tool-1.0-1.noarch.rpm",
-                "tool-2.0-1.noarch.rpm",
-                "tool-extras-1.0-1.noarch.rpm"
+                "github.com_acme_tool/tool-1.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-2.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-extras-1.0-1.noarch.rpm"
             ]
         );
 
@@ -883,6 +1376,25 @@ mod tests {
         gh.lock().unwrap().release = release("v3.0", &[("notes.txt", b"x".to_vec())]);
         assert!(!updater.update_all().await);
         assert_eq!(files(&downloads).len(), 3);
+
+        // After all downloads, versions more than three behind are removed.
+        for v in ["3.0", "4.0", "5.0"] {
+            gh.lock().unwrap().release = release(
+                &format!("v{v}"),
+                &[("tool.x86_64.rpm", testutil::build_rpm("tool", v, &[]))],
+            );
+            assert!(updater.update_all().await);
+        }
+        assert_eq!(
+            files(&downloads),
+            [
+                "github.com_acme_tool/tool-2.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-3.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-4.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-5.0-1.noarch.rpm",
+                "github.com_acme_tool/tool-extras-1.0-1.noarch.rpm"
+            ]
+        );
     }
 
     #[test]
@@ -941,7 +1453,10 @@ mod tests {
         let updater = Updater::new(dir.path().join("sources"), dir.path().to_owned()).unwrap();
 
         // A plain GET gets the HTML page, which is rejected with a hint.
-        let err = updater.update(&url.clone().into()).await.unwrap_err();
+        let err = updater
+            .update("vendor", &url.clone().into())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("post="), "{err:#}");
         assert!(files(dir.path()).is_empty());
 
@@ -949,12 +1464,12 @@ mod tests {
             url,
             form: Some("accept_license_agreement=accepted".into()),
         };
-        let out = updater.update(&req).await.unwrap();
+        let out = updater.update("vendor", &req).await.unwrap();
         assert!(
-            matches!(out, Outcome::Updated { ref file, .. } if file == "vendor-tool-3.0-1.noarch.rpm")
+            matches!(out, Outcome::Updated { ref file, .. } if file == "vendor/vendor-tool-3.0-1.noarch.rpm")
         );
         assert!(matches!(
-            updater.update(&req).await.unwrap(),
+            updater.update("vendor", &req).await.unwrap(),
             Outcome::Unchanged { .. }
         ));
     }
