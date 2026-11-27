@@ -18,6 +18,7 @@ use tokio::sync::{Notify, oneshot};
 
 const FEDORA: &str = "registry.fedoraproject.org/fedora:latest";
 const AMAZON_LINUX: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
+const DEBIAN: &str = "docker.io/library/debian:stable-slim";
 const REPO_ID: &str = "rpmserve-test";
 const GREETING: &str = "hello from rpm-server";
 
@@ -122,8 +123,15 @@ async fn start_server(signed: bool) -> TestServer {
 }
 
 async fn podman_run(image: &str, script: &str) -> Output {
+    podman_run_with(&[], image, script).await
+}
+
+/// Runs `script` in `image` with extra `podman run` arguments (e.g. volumes).
+async fn podman_run_with(args: &[&str], image: &str, script: &str) -> Output {
     let output = tokio::process::Command::new("podman")
-        .args(["run", "--rm", "--network=host", image, "sh", "-c", script])
+        .args(["run", "--rm", "--network=host"])
+        .args(args)
+        .args([image, "sh", "-c", script])
         .output()
         .await
         .expect("failed to execute podman; it is required for these tests");
@@ -313,4 +321,106 @@ echo "SECOND: $(vendor-tool)"
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FIRST: vendor-tool 1.0"));
     assert!(stdout.contains("SECOND: vendor-tool 2.0"));
+}
+
+/// data.tar compressions `dpkg-deb -Z` supports that the converter reads.
+const DEB_COMPRESSIONS: [&str; 3] = ["gzip", "xz", "zstd"];
+
+/// Builds `/work/vendor/hello-deb-<compression>.deb` with dpkg-deb, one per
+/// compression. Each carries a conffile, a symlink, an empty directory, an
+/// unsatisfiable dependency and a failing postinst; the last two must not
+/// survive the conversion.
+fn dpkg_deb_script() -> String {
+    let compressions = DEB_COMPRESSIONS.join(" ");
+    format!(
+        r#"set -ex
+mkdir -p /work/vendor
+for z in {compressions}; do
+  root=/tmp/hello-deb-$z
+  mkdir -p $root/DEBIAN $root/usr/bin $root/etc/hello-deb-$z $root/var/lib/hello-deb-$z
+  cat > $root/DEBIAN/control <<EOF
+Package: hello-deb-$z
+Version: 1:1.2-3
+Architecture: all
+Maintainer: rpm-server e2e <e2e@example.invalid>
+Depends: libc6 (>= 2.17), definitely-not-an-rpm-package
+Description: Greets from a converted .deb
+ Built by dpkg-deb with $z compression.
+EOF
+  echo /etc/hello-deb-$z/greeting > $root/DEBIAN/conffiles
+  printf '#!/bin/sh\nexit 1\n' > $root/DEBIAN/postinst
+  chmod 755 $root/DEBIAN/postinst
+  printf '#!/bin/sh\ncat /etc/hello-deb-%s/greeting\n' $z > $root/usr/bin/hello-deb-$z
+  chmod 755 $root/usr/bin/hello-deb-$z
+  echo "{GREETING} via $z" > $root/etc/hello-deb-$z/greeting
+  ln -s hello-deb-$z $root/usr/bin/hello-deb-$z-alias
+  dpkg-deb --root-owner-group -Z$z --build $root /work/vendor/hello-deb-$z.deb
+done
+"#
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fedora_dnf5_installs_converted_debs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rpms, debs) = (tmp.path().join("rpms"), tmp.path().join("debs"));
+    std::fs::create_dir(&rpms).unwrap();
+    std::fs::create_dir(&debs).unwrap();
+    let volume = format!("{}:/work:Z", debs.display());
+    let output = podman_run_with(&["-v", &volume], DEBIAN, &dpkg_deb_script()).await;
+    assert!(output.status.success(), "building .deb files failed");
+
+    let asc = generate_secret_key("rpm-server e2e <e2e@example.invalid>", None).unwrap();
+    let signer = Arc::new(RepoSigner::from_armored(&asc, None, true).unwrap());
+    let deb_root = debs.clone();
+    let repo = tokio::task::spawn_blocking(move || {
+        Scanner::new(rpms, Some(signer))
+            .with_deb_root(deb_root)
+            .scan()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(repo.package_count, DEB_COMPRESSIONS.len());
+    for z in DEB_COMPRESSIONS {
+        let served = format!("deb/vendor/hello-deb-{z}.rpm");
+        assert!(repo.get(&served).is_some(), "{served} is not served");
+        assert!(repo.get(&format!("deb/vendor/hello-deb-{z}.deb")).is_none());
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let state = AppState::new(repo, REPO_ID.into(), None);
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(rpm_server::serve(listener, state, async {
+        let _ = rx.await;
+    }));
+
+    let compressions = DEB_COMPRESSIONS.join(" ");
+    let script = format!(
+        r#"set -ex
+curl -fsS -o /etc/yum.repos.d/{REPO_ID}.repo {base_url}/{REPO_ID}.repo
+grep -q '^gpgcheck=1$' /etc/yum.repos.d/{REPO_ID}.repo
+test "$(curl -s -o /dev/null -w '%{{http_code}}' {base_url}/deb/vendor/hello-deb-xz.deb)" = 404
+for z in {compressions}; do
+  dnf -y --disablerepo='*' --enablerepo={REPO_ID} install hello-deb-$z
+  echo "GREETING: $(hello-deb-$z-alias)"
+  rpm -qc hello-deb-$z | grep -qx /etc/hello-deb-$z/greeting
+  rpm -q --qf '%{{EPOCH}}:%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\n' hello-deb-$z | grep -qx '1:1.2-3.noarch'
+  test -d /var/lib/hello-deb-$z
+  rpm -V hello-deb-$z
+done
+"#
+    );
+    let output = podman_run(FEDORA, &script).await;
+    let _ = tx.send(());
+    assert!(output.status.success(), "container script failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for z in DEB_COMPRESSIONS {
+        assert!(
+            stdout.contains(&format!("GREETING: {GREETING} via {z}")),
+            "greeting of hello-deb-{z} missing from output"
+        );
+    }
 }

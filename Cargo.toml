@@ -1,6 +1,6 @@
 [package]
 name = "rpm-server"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -17,8 +17,12 @@ pgp = "=0.20.0"
 quick-xml = "0.42.0"
 # pgp 0.20 uses rand 0.8's RNG traits.
 rand = "0.8"
+# The payload builder converts .deb files; gzip keeps it pure Rust (the
+# zstd/xz features would need C toolchains for the musl image).
 rpm = { version = "0.30.2", default-features = false, features = [
   "signature-pgp",
+  "payload",
+  "gzip-compression",
 ] }
 # EVR ordering (rpmvercmp); the rpm crate uses it but does not re-export it.
 rpm-version = "0.5"
@@ -44,14 +48,24 @@ webpki-root-certs = "1"
 notify = "8.2.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Reading .deb files (ar archive of tarballs); pure Rust decoders for the
+# xz and zstd members so the static musl build needs no C libraries.
+ar = "0.9.0"
+tar = { version = "0.4.46", default-features = false }
+ruzstd = "0.9.1"
+lzma-rust2 = { version = "0.26.0", default-features = false, features = [
+  "std",
+  "optimization",
+  "xz",
+] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
-# Tests build RPMs in memory, which needs the payload builder.
-rpm = { version = "0.30.2", default-features = false, features = [
-  "signature-pgp",
-  "payload",
-  "gzip-compression",
+# Tests build xz-compressed .deb files.
+lzma-rust2 = { version = "0.26.0", default-features = false, features = [
+  "std",
+  "encoder",
+  "xz",
 ] }
 tower = { version = "0.5.3", features = ["util"] }
 

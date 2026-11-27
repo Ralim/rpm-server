@@ -1,7 +1,7 @@
 //! Command line / environment configuration.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -67,6 +67,12 @@ pub struct Config {
     /// Must not be inside --dir.
     #[arg(long, env = "RPM_SERVER_DOWNLOAD_DIR")]
     pub download_dir: Option<PathBuf>,
+
+    /// Writable folder of .deb files (searched recursively). Each is
+    /// converted to an .rpm stored next to it, served under /deb/; the .deb
+    /// files are not served. Must not overlap --dir or --download-dir.
+    #[arg(long, env = "RPM_SERVER_DEB_DIR")]
+    pub deb_dir: Option<PathBuf>,
 
     /// Seconds between source downloads (they also run at startup).
     #[arg(long, env = "RPM_SERVER_UPDATE_INTERVAL", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(1..))]
@@ -140,24 +146,47 @@ impl Config {
         let Some(download) = &self.download_dir else {
             return Ok(None);
         };
-        std::fs::create_dir_all(download)
-            .with_context(|| format!("creating download folder {}", download.display()))?;
-        let download = download
-            .canonicalize()
-            .with_context(|| format!("resolving {}", download.display()))?;
         let dir = self
             .dir
             .canonicalize()
             .with_context(|| format!("resolving {}", self.dir.display()))?;
-        if download.starts_with(&dir) || dir.starts_with(&download) {
+        prepare_extra_dir(download, "download folder", &[("package folder", &dir)]).map(Some)
+    }
+
+    /// Creates the deb folder and checks it overlaps neither `dir` nor
+    /// `download_dir` (the folder returned by [`Self::prepare_download_dir`]).
+    pub fn prepare_deb_dir(&self, download_dir: Option<&Path>) -> Result<Option<PathBuf>> {
+        let Some(deb) = &self.deb_dir else {
+            return Ok(None);
+        };
+        let dir = self
+            .dir
+            .canonicalize()
+            .with_context(|| format!("resolving {}", self.dir.display()))?;
+        let mut others = vec![("package folder", dir.as_path())];
+        others.extend(download_dir.map(|d| ("download folder", d)));
+        prepare_extra_dir(deb, "deb folder", &others).map(Some)
+    }
+}
+
+/// Creates the folder `path` (described as `what` in errors) and returns its
+/// canonical path, after checking it does not overlap any of the canonical
+/// `others`, which would list their packages twice.
+fn prepare_extra_dir(path: &Path, what: &str, others: &[(&str, &Path)]) -> Result<PathBuf> {
+    std::fs::create_dir_all(path).with_context(|| format!("creating {what} {}", path.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    for (other_what, other) in others {
+        if path.starts_with(other) || other.starts_with(&path) {
             anyhow::bail!(
-                "download folder {} must not overlap the package folder {}",
-                download.display(),
-                dir.display()
+                "{what} {} must not overlap the {other_what} {}",
+                path.display(),
+                other.display()
             );
         }
-        Ok(Some(download))
     }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -175,6 +204,7 @@ mod tests {
         assert_eq!(c.update_interval, 86400);
         assert!(c.load_signer().unwrap().is_none());
         assert!(c.prepare_download_dir().unwrap().is_none());
+        assert!(c.prepare_deb_dir(None).unwrap().is_none());
     }
 
     #[test]
@@ -235,6 +265,56 @@ mod tests {
             .prepare_download_dir()
             .unwrap();
         assert!(ok.unwrap().is_dir());
+    }
+
+    #[test]
+    fn deb_dir_must_not_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("rpms");
+        std::fs::create_dir(&main).unwrap();
+        let downloads = tmp.path().join("downloads");
+        let parse = |deb: &std::path::Path| {
+            Config::try_parse_from([
+                "rpm-server".as_ref(),
+                "--dir".as_ref(),
+                main.as_os_str(),
+                "--download-dir".as_ref(),
+                downloads.as_os_str(),
+                "--deb-dir".as_ref(),
+                deb.as_os_str(),
+            ])
+            .unwrap()
+        };
+        let prepare = |deb: &std::path::Path| {
+            let c = parse(deb);
+            let download = c.prepare_download_dir().unwrap();
+            c.prepare_deb_dir(download.as_deref())
+        };
+        let err = prepare(&main.join("deb")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must not overlap the package folder"),
+            "{err:#}"
+        );
+        let err = prepare(&downloads.join("deb")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must not overlap the download folder"),
+            "{err:#}"
+        );
+        assert!(prepare(tmp.path()).is_err());
+        let ok = prepare(&tmp.path().join("deb")).unwrap().unwrap();
+        assert!(ok.is_dir());
+        assert!(ok.is_absolute());
+
+        // Without a download folder only the package folder is checked.
+        let c = Config::try_parse_from([
+            "rpm-server".as_ref(),
+            "--dir".as_ref(),
+            main.as_os_str(),
+            "--deb-dir".as_ref(),
+            downloads.join("deb").as_os_str(),
+        ])
+        .unwrap();
+        assert!(c.prepare_deb_dir(None).unwrap().is_some());
     }
 
     #[test]

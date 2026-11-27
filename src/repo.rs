@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::deb::{self, DebConverter};
 use crate::package::RpmEntry;
 use crate::repodata;
 use crate::signing::RepoSigner;
@@ -20,6 +21,7 @@ use crate::signing::RepoSigner;
 pub const KEY_PATH: &str = "RPM-GPG-KEY";
 /// Path under which the mounted package folder appears in the repository.
 pub const STATIC_PREFIX: &str = "static";
+const RPM_SUFFIX: &str = ".rpm";
 const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -133,17 +135,26 @@ impl Repo {
     }
 }
 
+/// A file found by [`walk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileStamp {
-    rel: String,
-    abs: PathBuf,
-    size: u64,
-    mtime: SystemTime,
+pub(crate) struct FileStamp {
+    /// Repository path, `/`-separated.
+    pub(crate) rel: String,
+    pub(crate) abs: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mtime: SystemTime,
 }
 
-/// Recursively collects `.rpm` files under `dir`, whose repository path is
-/// `rel`. Hidden entries are skipped.
-fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<FileStamp>) -> Result<()> {
+/// Recursively collects the files under `dir` whose name ends in `suffix`
+/// (e.g. `.rpm`); `rel` is the repository path of `dir`. Hidden entries are
+/// skipped.
+pub(crate) fn walk(
+    dir: &Path,
+    rel: &str,
+    suffix: &str,
+    depth: usize,
+    out: &mut Vec<FileStamp>,
+) -> Result<()> {
     let read = fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
     for item in read {
         let item = item?;
@@ -168,10 +179,10 @@ fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<FileStamp>) -> Result
                 warn!(path = %item.path().display(), "maximum directory depth reached");
                 continue;
             }
-            if let Err(err) = walk(&item.path(), &child_rel, depth + 1, out) {
+            if let Err(err) = walk(&item.path(), &child_rel, suffix, depth + 1, out) {
                 warn!(path = %item.path().display(), %err, "skipping directory");
             }
-        } else if meta.is_file() && name.ends_with(".rpm") {
+        } else if meta.is_file() && name.ends_with(suffix) {
             out.push(FileStamp {
                 rel: child_rel,
                 abs: item.path(),
@@ -214,6 +225,8 @@ pub struct Scanner {
     root: PathBuf,
     /// Additional folders served under a fixed top-level directory name.
     extra_roots: Vec<(String, PathBuf)>,
+    /// Converts the `.deb` files of the deb folder before each scan.
+    deb_converter: Option<DebConverter>,
     signer: Option<Arc<RepoSigner>>,
     cache: HashMap<String, Arc<RpmEntry>>,
     last: Option<Vec<FileStamp>>,
@@ -224,6 +237,7 @@ impl Scanner {
         Self {
             root,
             extra_roots: Vec::new(),
+            deb_converter: None,
             signer,
             cache: HashMap::new(),
             last: None,
@@ -236,12 +250,26 @@ impl Scanner {
         self
     }
 
+    /// Converts the `.deb` files in `dir` to RPMs stored next to them at the
+    /// start of every scan, and serves those RPMs under `/deb/`. `dir` must
+    /// be writable.
+    pub fn with_deb_root(mut self, dir: PathBuf) -> Self {
+        self.deb_converter = Some(DebConverter::new(dir.clone()));
+        self.with_extra_root(deb::URL_PREFIX, dir)
+    }
+
     /// Returns a new snapshot, or `None` if nothing changed since the last scan.
     pub fn scan(&mut self) -> Result<Option<Repo>> {
+        if let Some(converter) = &mut self.deb_converter
+            && let Err(err) = converter.convert_pending()
+        {
+            // The same folder is walked below, which logs the failure.
+            debug!("skipping .deb conversion: {err:#}");
+        }
         let mut stamps = Vec::new();
-        walk(&self.root, STATIC_PREFIX, 1, &mut stamps)?;
+        walk(&self.root, STATIC_PREFIX, RPM_SUFFIX, 1, &mut stamps)?;
         for (name, dir) in &self.extra_roots {
-            if let Err(err) = walk(dir, name, 1, &mut stamps) {
+            if let Err(err) = walk(dir, name, RPM_SUFFIX, 1, &mut stamps) {
                 warn!(dir = %dir.display(), "skipping folder: {err:#}");
             }
         }
@@ -433,6 +461,45 @@ mod tests {
         let mut scanner = Scanner::new(main.path().to_owned(), None)
             .with_extra_root("downloaded", PathBuf::from("/nonexistent/rpm-server-test"));
         assert_eq!(scanner.scan().unwrap().unwrap().package_count, 2);
+    }
+
+    #[test]
+    fn deb_root_serves_converted_rpms_only() {
+        use crate::deb::archive::Compression;
+        use crate::deb::testutil::DebBuilder;
+
+        let main = tempfile::tempdir().unwrap();
+        let debs = tempfile::tempdir().unwrap();
+        fs::create_dir(debs.path().join("vendor")).unwrap();
+        fs::write(
+            debs.path().join("vendor/tool_1.0-2_amd64.deb"),
+            DebBuilder::new("tool", "1.0-2", "amd64")
+                .file("/usr/bin/tool", b"#!/bin/sh\n", 0o755)
+                .build(Compression::Zstd),
+        )
+        .unwrap();
+
+        let signer = testutil::signer();
+        let mut scanner = Scanner::new(main.path().to_owned(), Some(signer))
+            .with_deb_root(debs.path().to_owned());
+        let repo = scanner.scan().unwrap().unwrap();
+        assert_eq!(repo.package_count, 1);
+        assert!(debs.path().join("vendor/tool_1.0-2_amd64.rpm").is_file());
+        match repo.get("deb/vendor/tool_1.0-2_amd64.rpm") {
+            Some(Entry::Rpm(e)) => {
+                assert_eq!(e.info.nevra(), "tool-1.0-2.x86_64");
+                assert!(!e.prefix.is_empty(), "converted packages are signed");
+            }
+            other => panic!("unexpected entry: {other:?}"),
+        }
+        assert!(repo.get("deb/vendor/tool_1.0-2_amd64.deb").is_none());
+        assert_eq!(
+            names(&repo.list_dir("deb/vendor/").unwrap()),
+            ["tool_1.0-2_amd64.rpm"]
+        );
+
+        // The conversion is not repeated, so the folder is unchanged.
+        assert!(scanner.scan().unwrap().is_none());
     }
 
     #[test]

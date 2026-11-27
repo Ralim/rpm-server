@@ -2,6 +2,7 @@
 //! `repodata/` in memory and optionally re-signing packages on the fly.
 
 pub mod config;
+pub mod deb;
 pub mod health;
 pub mod package;
 pub mod repo;
@@ -153,12 +154,17 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let download_dir = config.prepare_download_dir()?;
+    let deb_dir = config.prepare_deb_dir(download_dir.as_deref())?;
     let dir = config.dir.clone();
     let scan_download_dir = download_dir.clone();
+    let scan_deb_dir = deb_dir.clone();
     let (scanner, repo) = tokio::task::spawn_blocking(move || {
         let mut scanner = Scanner::new(dir, signer);
         if let Some(d) = scan_download_dir {
             scanner = scanner.with_extra_root(sources::URL_PREFIX, d);
+        }
+        if let Some(d) = scan_deb_dir {
+            scanner = scanner.with_deb_root(d);
         }
         let repo = scanner.scan()?;
         anyhow::Ok((scanner, repo))
@@ -173,6 +179,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     let mut watch_roots = vec![config.dir.clone()];
     watch_roots.extend(download_dir.clone());
+    watch_roots.extend(deb_dir);
     match watch::spawn_watcher(watch_roots, rescan_trigger.clone(), watch::DEBOUNCE) {
         Ok(_) => info!("watching package folders for changes"),
         Err(err) => warn!("filesystem watching unavailable, relying on periodic rescans: {err:#}"),

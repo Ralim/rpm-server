@@ -38,6 +38,7 @@ The repository root contains:
 
 - `static/`: the RPMs from the mounted folder, keeping its subfolder layout
 - `downloaded/`: RPMs fetched from online sources (see below)
+- `deb/`: RPMs converted from `.deb` packages (see below)
 - `repodata/`: the generated metadata
 - `RPM-GPG-KEY` and `<repo-id>.repo`
 
@@ -121,6 +122,29 @@ How downloads work:
 - **Failures:** if a download fails or isn't an RPM, a warning is logged and the stored files stay as they were.
 - **GitHub rate limit:** release lookups use the GitHub API, which allows 60 unauthenticated requests per hour per IP. That is plenty for a daily refresh, but a shared NAT address can exhaust it. Set `RPM_SERVER_GITHUB_TOKEN` (or `RPM_SERVER_GITHUB_TOKEN_FILE`) to a token; for public repositories it needs no scopes. The token is only sent to the API, never to the asset download hosts.
 
+### Debian packages
+
+For vendors that only ship a `.deb`, give the server a writable folder of them:
+
+```sh
+podman run -d -p 8080:8080 -v ./rpms:/srv/rpms:ro,Z \
+  -v ./debs:/srv/debs:Z \
+  -e RPM_SERVER_DEB_DIR=/srv/debs \
+  rpm-server
+```
+
+The folder must be writable by uid 65532.
+
+Every `*.deb` in it (searched recursively, hidden entries skipped) is converted to an RPM stored next to it with the same name: `vendor/tool_1.0-1_amd64.deb` becomes `vendor/tool_1.0-1_amd64.rpm`, served as `/deb/vendor/tool_1.0-1_amd64.rpm`. The `.deb` files themselves are not served. Conversion runs before each rescan, so new files are picked up like any other change. Existing RPMs are not converted again on restart; a `.deb` is converted again only when it is newer than its RPM. A `.deb` that fails to convert is logged once and retried when it changes. Removing a `.deb` does not remove its RPM; delete both.
+
+The conversion works like `alien`'s defaults:
+
+- **Name, version, arch:** `[epoch:]version[-revision]` becomes epoch, version and release (`-` and `:` in the version become `_`; no revision gives release `1`). Debian architectures are mapped (`amd64` to `x86_64`, `arm64` to `aarch64`, `all` to `noarch`, ...); others are rejected.
+- **Dependencies are dropped.** Debian package names don't match RPM ones, so `Depends` and similar fields are not carried over. Install what the package needs yourself.
+- **Maintainer scripts are dropped** (`preinst`, `postinst`, `prerm`, `postrm`, `config`, `triggers`), with a warning, since they expect dpkg. Packages that rely on them (e.g. to create users or enable services) need that done by hand.
+- **Files:** regular files, symlinks and hard links keep their mode, owner and mtime. `conffiles` become `%config(noreplace)`. Directories are only packaged when the `.deb` ships them empty; shared ones like `/usr/bin` are left to the packages that own them, as listing them with Debian's modes would conflict with the `filesystem` package.
+- **Format:** `control.tar` and `data.tar` may be uncompressed, gzip, xz or zstd. The result is a gzip-compressed RPM v4, signed like the others when a key is configured. A package's files are held in memory during conversion (at most 4 GiB).
+
 ### Client setup
 
 ```sh
@@ -147,6 +171,7 @@ Every flag (see `rpm-server --help`) has an environment variable:
 | `RPM_SERVER_SOURCES_FILE`                                      |                | File of RPM or GitHub project URLs to download (needs a download folder)                      |
 | `RPM_SERVER_DOWNLOAD_DIR`                                      |                | Writable folder for downloads, served under `/downloaded/`; must not overlap `RPM_SERVER_DIR` |
 | `RPM_SERVER_UPDATE_INTERVAL`                                   | `86400`        | Seconds between source downloads                                                              |
+| `RPM_SERVER_DEB_DIR`                                           |                | Writable folder of `.deb` files, converted to RPMs next to them and served under `/deb/`      |
 | `RPM_SERVER_GITHUB_TOKEN` / `RPM_SERVER_GITHUB_TOKEN_FILE`     |                | Optional GitHub token for release lookups (raises the API rate limit)                         |
 | `RUST_LOG`                                                     | `info`         | Log filter (`tower_http=debug` logs requests)                                                 |
 
@@ -154,4 +179,4 @@ Ed25519 and RSA keys both work on EL9 / AL2023 / Fedora. Use RSA for EL7 / Amazo
 
 ## Testing
 
-`cargo test` runs the unit tests and `tests/dnf_container.rs`. That test serves a repo from the test process and installs from it with dnf5 (Fedora) and dnf4 (Amazon Linux 2023) running in `podman --network=host` containers, so podman and access to the image registries are required.
+`cargo test` runs the unit tests and `tests/dnf_container.rs`. That test serves a repo from the test process and installs from it with dnf5 (Fedora) and dnf4 (Amazon Linux 2023) running in `podman --network=host` containers, so podman and access to the image registries are required. The `.deb` conversion test builds its packages with `dpkg-deb` in a Debian container.
